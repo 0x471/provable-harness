@@ -1,0 +1,67 @@
+[
+  {
+    "name": "read_file",
+    "description": "Read a file from the user's documents.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File name, e.g. brief.md"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "binding": {
+      "read_file": {
+        "param": "path",
+        "prefix": "/docs/"
+      }
+    }
+  },
+  {
+    "name": "get_weather",
+    "description": "Today's weather for a city.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "city": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "city"
+      ]
+    },
+    "binding": {
+      "http_get": {
+        "url": "https://api.weather.example/v1/today",
+        "query": [
+          "city"
+        ]
+      }
+    }
+  },
+  {
+    "name": "submit_report",
+    "description": "Submit the weather report.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "report": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "report"
+      ]
+    },
+    "binding": {
+      "http_post": {
+        "url": "https://api.weather.example/v1/report"
+      }
+    }
+  }
+]

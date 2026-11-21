@@ -1,0 +1,8 @@
+{
+  "model_id": "scripted/native-v1",
+  "replies": [
+    "[{\"type\": \"text\", \"text\": \"I'll read the brief and get the weather.\"}, {\"type\": \"tool_use\", \"id\": \"toolu_01\", \"name\": \"read_file\", \"input\": {\"path\": \"brief.md\"}}, {\"type\": \"tool_use\", \"id\": \"toolu_02\", \"name\": \"get_weather\", \"input\": {\"city\": \"paris\"}}]",
+    "[{\"type\": \"tool_use\", \"id\": \"toolu_03\", \"name\": \"submit_report\", \"input\": {\"report\": \"Paris: 18C, light rain\"}}]",
+    "Report submitted: Paris is 18C with light rain."
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "task": "Follow the brief in brief.md.",
+  "system_prompt": "system_prompt.md",
+  "tools": "tools.json"
+}
