@@ -8,7 +8,8 @@ use crate::{
         handshake::{DigitallySignedStruct, DistinguishedNames},
     },
 };
-use ring::digest::Digest;
+// [ph fork] was `ring::digest::Digest`; only `.as_ref()` bytes are used.
+type Digest = [u8];
 use rustls_pki_types as pki_types;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -281,7 +282,7 @@ impl ServerCertVerifier for WebPkiVerifier {
         let time = pki_types::UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?);
 
         cert.verify_for_usage(
-            webpki::ALL_VERIFICATION_ALGS,
+            ph_webpki_algs::ALL_VERIFICATION_ALGS,
             &self.roots.roots,
             &intermediates,
             time,
@@ -345,68 +346,25 @@ impl WebPkiVerifier {
     }
 }
 
-/// Policy for enforcing Certificate Transparency.
-///
-/// Because Certificate Transparency logs are sharded on a per-year basis and
-/// can be trusted or distrusted relatively quickly, rustls stores a validation
-/// deadline. Server certificates will be validated against the configured CT
-/// logs until the deadline expires. After the deadline, certificates will no
-/// longer be validated, and a warning message will be logged. The deadline
-/// may vary depending on how often you deploy builds with updated dependencies.
+/// [ph fork] Certificate Transparency checking removed: the `sct` crate depends
+/// on ring. This type can no longer be constructed outside this crate, and any
+/// attempt to use it fails closed.
 #[allow(unreachable_pub)]
 #[derive(Debug, Clone)]
 pub struct CertificateTransparencyPolicy {
-    logs: &'static [&'static sct::Log<'static>],
-    validation_deadline: SystemTime,
+    _private: (),
 }
 
 impl CertificateTransparencyPolicy {
-    /// Create a new policy.
-    #[allow(unreachable_pub)]
-    pub fn new(
-        logs: &'static [&'static sct::Log<'static>],
-        validation_deadline: SystemTime,
-    ) -> Self {
-        Self {
-            logs,
-            validation_deadline,
-        }
-    }
-
     fn verify(
         &self,
-        cert: &Certificate,
-        now: SystemTime,
-        scts: &mut dyn Iterator<Item = &[u8]>,
+        _cert: &Certificate,
+        _now: SystemTime,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
     ) -> Result<(), Error> {
-        if self.logs.is_empty() || self.validation_deadline.duration_since(now).is_err() {
-            return Ok(());
-        }
-
-        let now = unix_time_millis(now)?;
-        let mut last_sct_error = None;
-        for sct in scts {
-            #[cfg_attr(not(feature = "logging"), allow(unused_variables))]
-            match sct::verify_sct(&cert.0, sct, now, self.logs) {
-                Ok(_) => {
-                    return Ok(());
-                }
-                Err(e) => {
-                    if e.should_be_fatal() {
-                        return Err(Error::InvalidSct(e));
-                    }
-                    last_sct_error = Some(e);
-                }
-            }
-        }
-
-        /* If we were supplied with some logs, and some SCTs,
-         * but couldn't verify any of them, fail the handshake. */
-        if let Some(last_sct_error) = last_sct_error {
-            return Err(Error::InvalidSct(last_sct_error));
-        }
-
-        Ok(())
+        Err(Error::General(
+            "certificate transparency is not supported in this build".into(),
+        ))
     }
 }
 
@@ -424,23 +382,24 @@ pub(crate) fn pki_error(error: webpki::Error) -> Error {
 }
 
 static ECDSA_SHA256: SignatureAlgorithms = &[
-    webpki::ring::ECDSA_P256_SHA256,
-    webpki::ring::ECDSA_P384_SHA256,
+    ph_webpki_algs::ECDSA_P256_SHA256,
+    ph_webpki_algs::ECDSA_P384_SHA256,
 ];
 
 static ECDSA_SHA384: SignatureAlgorithms = &[
-    webpki::ring::ECDSA_P256_SHA384,
-    webpki::ring::ECDSA_P384_SHA384,
+    ph_webpki_algs::ECDSA_P256_SHA384,
+    ph_webpki_algs::ECDSA_P384_SHA384,
 ];
 
-static ED25519: SignatureAlgorithms = &[webpki::ring::ED25519];
+// [ph fork] Ed25519 is not supported by ph-webpki-algs: fail closed.
+static ED25519: SignatureAlgorithms = &[];
 
-static RSA_SHA256: SignatureAlgorithms = &[webpki::ring::RSA_PKCS1_2048_8192_SHA256];
-static RSA_SHA384: SignatureAlgorithms = &[webpki::ring::RSA_PKCS1_2048_8192_SHA384];
-static RSA_SHA512: SignatureAlgorithms = &[webpki::ring::RSA_PKCS1_2048_8192_SHA512];
-static RSA_PSS_SHA256: SignatureAlgorithms = &[webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY];
-static RSA_PSS_SHA384: SignatureAlgorithms = &[webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY];
-static RSA_PSS_SHA512: SignatureAlgorithms = &[webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY];
+static RSA_SHA256: SignatureAlgorithms = &[ph_webpki_algs::RSA_PKCS1_2048_8192_SHA256];
+static RSA_SHA384: SignatureAlgorithms = &[ph_webpki_algs::RSA_PKCS1_2048_8192_SHA384];
+static RSA_SHA512: SignatureAlgorithms = &[ph_webpki_algs::RSA_PKCS1_2048_8192_SHA512];
+static RSA_PSS_SHA256: SignatureAlgorithms = &[ph_webpki_algs::RSA_PSS_2048_8192_SHA256_LEGACY_KEY];
+static RSA_PSS_SHA384: SignatureAlgorithms = &[ph_webpki_algs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY];
+static RSA_PSS_SHA512: SignatureAlgorithms = &[ph_webpki_algs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY];
 
 fn convert_scheme(scheme: SignatureScheme) -> Result<SignatureAlgorithms, Error> {
     match scheme {
@@ -485,27 +444,27 @@ pub enum SignatureAlgorithm {
 impl SignatureAlgorithm {
     pub fn from_alg(alg: &dyn pki_types::SignatureVerificationAlgorithm) -> Self {
         let id = alg.signature_alg_id();
-        if id == webpki::ring::ECDSA_P256_SHA256.signature_alg_id() {
+        if id == ph_webpki_algs::ECDSA_P256_SHA256.signature_alg_id() {
             SignatureAlgorithm::ECDSA_NISTP256_SHA256
-        } else if id == webpki::ring::ECDSA_P256_SHA384.signature_alg_id() {
+        } else if id == ph_webpki_algs::ECDSA_P256_SHA384.signature_alg_id() {
             SignatureAlgorithm::ECDSA_NISTP256_SHA384
-        } else if id == webpki::ring::ECDSA_P384_SHA256.signature_alg_id() {
+        } else if id == ph_webpki_algs::ECDSA_P384_SHA256.signature_alg_id() {
             SignatureAlgorithm::ECDSA_NISTP384_SHA256
-        } else if id == webpki::ring::ECDSA_P384_SHA384.signature_alg_id() {
+        } else if id == ph_webpki_algs::ECDSA_P384_SHA384.signature_alg_id() {
             SignatureAlgorithm::ECDSA_NISTP384_SHA384
-        } else if id == webpki::ring::ED25519.signature_alg_id() {
+        } else if id == pki_types::alg_id::ED25519 { // [ph fork] identifier only; Ed25519 verification is unsupported
             SignatureAlgorithm::ED25519
-        } else if id == webpki::ring::RSA_PKCS1_2048_8192_SHA256.signature_alg_id() {
+        } else if id == ph_webpki_algs::RSA_PKCS1_2048_8192_SHA256.signature_alg_id() {
             SignatureAlgorithm::RSA_PKCS1_2048_8192_SHA256
-        } else if id == webpki::ring::RSA_PKCS1_2048_8192_SHA384.signature_alg_id() {
+        } else if id == ph_webpki_algs::RSA_PKCS1_2048_8192_SHA384.signature_alg_id() {
             SignatureAlgorithm::RSA_PKCS1_2048_8192_SHA384
-        } else if id == webpki::ring::RSA_PKCS1_2048_8192_SHA512.signature_alg_id() {
+        } else if id == ph_webpki_algs::RSA_PKCS1_2048_8192_SHA512.signature_alg_id() {
             SignatureAlgorithm::RSA_PKCS1_2048_8192_SHA512
-        } else if id == webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY.signature_alg_id() {
+        } else if id == ph_webpki_algs::RSA_PSS_2048_8192_SHA256_LEGACY_KEY.signature_alg_id() {
             SignatureAlgorithm::RSA_PSS_2048_8192_SHA256_LEGACY_KEY
-        } else if id == webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY.signature_alg_id() {
+        } else if id == ph_webpki_algs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY.signature_alg_id() {
             SignatureAlgorithm::RSA_PSS_2048_8192_SHA384_LEGACY_KEY
-        } else if id == webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY.signature_alg_id() {
+        } else if id == ph_webpki_algs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY.signature_alg_id() {
             SignatureAlgorithm::RSA_PSS_2048_8192_SHA512_LEGACY_KEY
         } else {
             unreachable!()
@@ -572,12 +531,13 @@ fn convert_alg_tls13(
     use crate::msgs::enums::SignatureScheme::*;
 
     match scheme {
-        ECDSA_NISTP256_SHA256 => Ok(webpki::ring::ECDSA_P256_SHA256),
-        ECDSA_NISTP384_SHA384 => Ok(webpki::ring::ECDSA_P384_SHA384),
-        ED25519 => Ok(webpki::ring::ED25519),
-        RSA_PSS_SHA256 => Ok(webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY),
-        RSA_PSS_SHA384 => Ok(webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY),
-        RSA_PSS_SHA512 => Ok(webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY),
+        ECDSA_NISTP256_SHA256 => Ok(ph_webpki_algs::ECDSA_P256_SHA256),
+        ECDSA_NISTP384_SHA384 => Ok(ph_webpki_algs::ECDSA_P384_SHA384),
+        // [ph fork] Ed25519 unsupported: fail closed.
+        ED25519 => Err(Error::PeerMisbehavedError("ed25519 is not supported in this build".into())),
+        RSA_PSS_SHA256 => Ok(ph_webpki_algs::RSA_PSS_2048_8192_SHA256_LEGACY_KEY),
+        RSA_PSS_SHA384 => Ok(ph_webpki_algs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY),
+        RSA_PSS_SHA512 => Ok(ph_webpki_algs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY),
         _ => {
             let error_msg = format!("received unsupported sig scheme {scheme:?}");
             Err(Error::PeerMisbehavedError(error_msg))
@@ -621,6 +581,7 @@ fn verify_tls13(
         .map(|_| HandshakeSignatureValid::assertion())
 }
 
+#[allow(dead_code)] // [ph fork] only used by the removed CT policy
 fn unix_time_millis(now: SystemTime) -> Result<u64, Error> {
     now.duration_since(SystemTime::UNIX_EPOCH)
         .map(|dur| dur.as_secs())

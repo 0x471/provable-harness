@@ -71,7 +71,7 @@ pub enum Error {
     InvalidCertificateData(String),
 
     /// The presented SCT(s) were invalid.
-    InvalidSct(sct::Error),
+    InvalidSct(String), // [ph fork] was sct::Error
 
     /// A catch-all error for unlikely errors.
     General(String),
@@ -179,7 +179,6 @@ mod tests {
     #[test]
     fn smoke() {
         use crate::msgs::enums::{AlertDescription, ContentType, HandshakeType};
-        use sct;
 
         let all = vec![
             Error::InappropriateMessage {
@@ -201,7 +200,7 @@ mod tests {
             Error::InvalidCertificateSignatureType,
             Error::InvalidCertificateSignature,
             Error::InvalidCertificateData("Data".into()),
-            Error::InvalidSct(sct::Error::MalformedSct),
+            Error::InvalidSct("malformed".into()),
             Error::General("undocumented error".to_string()),
             Error::FailedToGetCurrentTime,
             Error::FailedToGetRandomBytes,

@@ -127,19 +127,7 @@ impl PayloadU8 {
 }
 
 pub struct PayloadU8Len(pub usize);
-impl ring::hkdf::KeyType for PayloadU8Len {
-    fn len(&self) -> usize {
-        self.0
-    }
-}
-
-impl From<ring::hkdf::Okm<'_, PayloadU8Len>> for PayloadU8 {
-    fn from(okm: ring::hkdf::Okm<PayloadU8Len>) -> Self {
-        let mut r = vec![0u8; okm.len().0];
-        okm.fill(&mut r[..]).unwrap();
-        Self::new(r)
-    }
-}
+// [ph fork] removed ring::hkdf glue for PayloadU8Len (TLS 1.3 key schedule, unused by verification).
 
 impl Codec for PayloadU8 {
     fn encode(&self, bytes: &mut Vec<u8>) {
