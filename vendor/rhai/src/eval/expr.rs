@@ -248,9 +248,12 @@ impl Engine {
                 .ok_or_else(|| ERR::ErrorUnboundThis(*var_pos).into())
                 .cloned(),
 
-            Expr::Variable(..) => self
-                .search_namespace(global, caches, scope, this_ptr, expr)
-                .map(Target::take_or_clone),
+            Expr::Variable(..) => {
+                let target = self.search_namespace(global, caches, scope, this_ptr, expr)?;
+                // (provable-harness patch) Reading a variable clones arrays and maps.
+                self.track_clone_volume(target.as_ref(), expr.position())?;
+                Ok(target.take_or_clone())
+            }
 
             Expr::InterpolatedString(x, _) => {
                 let mut concat = crate::new_smart_string();

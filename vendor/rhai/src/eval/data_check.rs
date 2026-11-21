@@ -119,7 +119,60 @@ pub fn calc_data_sizes(value: &Dynamic, _top: bool) -> (usize, usize, usize) {
     }
 }
 
+/// (provable-harness patch) Meter units per array or map element: walking an
+/// element costs about 16x as many zkVM cycles as a string byte.
+pub const ELEMENT_WEIGHT: usize = 16;
+
 impl Engine {
+    /// (provable-harness patch) Charge `units` to the data-volume meter.
+    #[inline]
+    pub(crate) fn track_data_volume(&self, units: usize, pos: Position) -> RhaiResultOf<()> {
+        if let Some(meter) = self.data_volume.as_ref() {
+            if let Some(token) = meter(units as u64) {
+                return Err(ERR::ErrorTerminated(token, pos).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// (provable-harness patch) Charge the full size of a value (string bytes,
+    /// array and map elements).
+    #[inline]
+    pub(crate) fn track_value_volume(&self, value: &Dynamic, pos: Position) -> RhaiResultOf<()> {
+        if self.data_volume.is_none() {
+            return Ok(());
+        }
+        let (a, m, s) = calc_data_sizes(value, true);
+        self.track_data_volume(1 + ELEMENT_WEIGHT * (a + m) + s, pos)
+    }
+
+    /// (provable-harness patch) Charge a value about to be cloned: its array
+    /// and map elements (strings are reference-counted, so cloning them is O(1)).
+    #[inline]
+    pub(crate) fn track_clone_volume(&self, value: &Dynamic, pos: Position) -> RhaiResultOf<()> {
+        if self.data_volume.is_none() {
+            return Ok(());
+        }
+        let (a, m, _) = calc_data_sizes(value, true);
+        self.track_data_volume(ELEMENT_WEIGHT * (a + m), pos)
+    }
+
+    /// (provable-harness patch) Charge the arguments of a function call.
+    #[inline]
+    pub(crate) fn track_args_volume(&self, args: &[&mut Dynamic], pos: Position) -> RhaiResultOf<()> {
+        if self.data_volume.is_none() {
+            return Ok(());
+        }
+        let units = args
+            .iter()
+            .map(|v| {
+                let (a, m, s) = calc_data_sizes(v, true);
+                ELEMENT_WEIGHT * (a + m) + s
+            })
+            .sum::<usize>();
+        self.track_data_volume(1 + units, pos)
+    }
+
     /// Raise an error if any data size exceeds limit.
     ///
     /// [`Position`] in [`EvalAltResult`][crate::EvalAltResult] is always [`NONE`][Position::NONE]
@@ -157,6 +210,9 @@ impl Engine {
         value: T,
         pos: Position,
     ) -> RhaiResultOf<T> {
+        // (provable-harness patch) Every checked result is metered.
+        self.track_value_volume(value.borrow(), pos)?;
+
         // If no data size limits, just return
         if !self.has_data_size_limit() {
             return Ok(value);

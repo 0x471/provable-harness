@@ -542,6 +542,8 @@ impl Engine {
         pos: Position,
     ) -> RhaiResultOf<(Dynamic, bool)> {
         self.track_operation(global, pos)?;
+        // (provable-harness patch) Meter the data the call is handed.
+        self.track_args_volume(args, pos)?;
 
         // Check for data race.
         #[cfg(not(feature = "no_closure"))]
@@ -1049,6 +1051,7 @@ impl Engine {
                 let context = func
                     .has_context()
                     .then(|| (self, fn_name, module.id(), &*global, pos).into());
+                self.track_args_volume(args, pos)?;
                 func.call(context, args)
                     .and_then(|r| self.check_data_size(r, pos))
             }
@@ -1063,6 +1066,7 @@ impl Engine {
             ) => {
                 let context =
                     has_context.then(|| (self, fn_name, module.id(), &*global, pos).into());
+                self.track_args_volume(args, pos)?;
                 func(context, args).and_then(|r| self.check_data_size(r, pos))
             }
 

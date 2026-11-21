@@ -449,6 +449,8 @@ impl Engine {
                 let value = self.eval_expr(global, caches, scope, this_ptr.as_deref_mut(), expr)?;
 
                 if value.is_hashable() {
+                    // (provable-harness patch) Hashing reads the whole value.
+                    self.track_value_volume(&value, expr.position())?;
                     let hash = calc_switch_value_hash(&value);
 
                     // First check hashes

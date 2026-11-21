@@ -141,6 +141,8 @@ pub struct Engine {
     /// Callback closure for progress reporting.
     #[cfg(not(feature = "unchecked"))]
     pub(crate) progress: Option<Box<crate::func::native::OnProgressCallback>>,
+    /// Data-volume metering callback (provable-harness patch).
+    pub(crate) data_volume: Option<Box<crate::func::native::OnDataVolumeCallback>>,
 
     /// Language options.
     pub(crate) options: LangOptions,
@@ -284,6 +286,7 @@ impl Engine {
 
         #[cfg(not(feature = "unchecked"))]
         progress: None,
+        data_volume: None,
 
         options: LangOptions::new(),
 

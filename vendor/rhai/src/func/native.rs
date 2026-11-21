@@ -747,10 +747,16 @@ pub type FnPlugin = dyn PluginFunc + Send + Sync;
 #[cfg(not(feature = "unchecked"))]
 #[cfg(not(feature = "sync"))]
 pub type OnProgressCallback = dyn Fn(u64) -> Option<Dynamic>;
+/// Callback function for data-volume metering (provable-harness patch).
+#[cfg(not(feature = "sync"))]
+pub type OnDataVolumeCallback = dyn Fn(u64) -> Option<Dynamic>;
 /// Callback function for progress reporting.
 #[cfg(not(feature = "unchecked"))]
 #[cfg(feature = "sync")]
 pub type OnProgressCallback = dyn Fn(u64) -> Option<Dynamic> + Send + Sync;
+/// Callback function for data-volume metering (provable-harness patch).
+#[cfg(feature = "sync")]
+pub type OnDataVolumeCallback = dyn Fn(u64) -> Option<Dynamic> + Send + Sync;
 
 /// Callback function for printing.
 #[cfg(not(feature = "sync"))]

@@ -229,6 +229,8 @@ impl Engine {
 
             #[cfg(not(feature = "no_index"))]
             Dynamic(Union::Str(s, ..)) => {
+                // (provable-harness patch) Indexing walks the string.
+                self.track_data_volume(1 + s.len(), idx_pos)?;
                 // Numeric index - character
                 match idx.as_int() {
                     Ok(index) => {

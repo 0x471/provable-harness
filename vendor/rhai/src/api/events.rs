@@ -248,6 +248,22 @@ impl Engine {
         self.progress = Some(Box::new(callback));
         self
     }
+    /// (provable-harness patch) Register a data-volume meter. It is called with
+    /// the size (bytes of strings, plus array and map elements) of the data each
+    /// step touches: the arguments and result of every native function call
+    /// (operators included when fast operators are off), values cloned by
+    /// variable and element reads, `switch` values, and strings indexed by
+    /// position. Returning `Some(token)` terminates the script, like
+    /// [`on_progress`][Engine::on_progress].
+    #[cfg(not(feature = "unchecked"))]
+    #[inline(always)]
+    pub fn on_data_volume(
+        &mut self,
+        callback: impl Fn(u64) -> Option<Dynamic> + SendSync + 'static,
+    ) -> &mut Self {
+        self.data_volume = Some(Box::new(callback));
+        self
+    }
     /// Override default action of `print` (print to stdout using [`println!`])
     ///
     /// # Example

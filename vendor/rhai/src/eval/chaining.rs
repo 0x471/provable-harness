@@ -416,7 +416,11 @@ impl Engine {
                             global, caches, new_scope, this_ptr, obj, idx_val, pos, op_pos, false,
                             true,
                         )
-                        .map(|v| (v.take_or_clone(), false))
+                        .and_then(|v| {
+                            // (provable-harness patch) Element reads clone arrays and maps.
+                            self.track_clone_volume(v.as_ref(), pos)?;
+                            Ok((v.take_or_clone(), false))
+                        })
                     }
                 }
             }
@@ -514,6 +518,8 @@ impl Engine {
                             global, caches, new_scope, this_ptr, obj, index, *pos, op_pos, false,
                             false,
                         )?;
+                        // (provable-harness patch) Property reads clone arrays and maps.
+                        self.track_clone_volume(item.as_ref(), *pos)?;
                         Ok((item.take_or_clone(), false))
                     }
                     // xxx.id op= ???

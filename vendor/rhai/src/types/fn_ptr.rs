@@ -500,6 +500,7 @@ impl FnPtr {
                 // so level is not incremented here.
                 let context = (engine, self.fn_name(), None, global, pos).into();
 
+                engine.track_args_volume(args, pos)?;
                 return func(context, args)
                     .and_then(|r| engine.check_data_size(r, pos))
                     .map_err(|err| err.fill_position(pos));

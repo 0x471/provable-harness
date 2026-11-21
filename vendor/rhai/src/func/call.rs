@@ -111,6 +111,7 @@ impl Engine {
 
                         let context = (self, fn_name, None, &*global, pos).into();
 
+                        self.track_args_volume(args, pos)?;
                         func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
                             .map(|v| (v, false))
@@ -210,6 +211,7 @@ impl Engine {
                         // Add the first argument with the object pointer
                         args.insert(0, target.as_mut());
 
+                        self.track_args_volume(args, pos)?;
                         func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
                             .map(|v| (v, false))
@@ -388,6 +390,7 @@ impl Engine {
 
                         let context = (self, fn_name, None, &*global, pos).into();
 
+                        self.track_args_volume(args, pos)?;
                         func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
                             .map(|v| (v, false))
@@ -523,6 +526,7 @@ impl Engine {
 
                         let context = (self, fn_name, None, &*global, pos).into();
 
+                        self.track_args_volume(args, pos)?;
                         return func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
                             .map_err(|err| err.fill_position(pos));
