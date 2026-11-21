@@ -1,0 +1,8 @@
+{
+  "model_id": "scripted/honest-agent-v1",
+  "replies": [
+    "I will read the brief and fetch the weather.\n```rhai\nlet brief = read_file(\"/docs/brief.md\");\nprint(brief);\nhttp_get(\"https://api.weather.example/v1/today?city=paris\")\n```\n",
+    "Writing and submitting the report.\n```rhai\nlet report = \"Paris today: 18C, light rain.\";\nwrite_file(\"/out/report.md\", report);\nhttp_post(\"https://api.weather.example/v1/report\", report)\n```\n",
+    "Done: /out/report.md written and the report was submitted (202 accepted)."
+  ]
+}

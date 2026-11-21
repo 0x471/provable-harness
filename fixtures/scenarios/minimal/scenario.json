@@ -1,0 +1,4 @@
+{
+  "task": "Say hello.",
+  "system_prompt": "../../system_prompt.md"
+}
