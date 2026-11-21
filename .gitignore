@@ -1,0 +1,18 @@
+/target
+/program/target
+/runs
+*.key
+/zktls/target
+/vendor/tlsn/target
+witness.bin
+*.presentation.tlsn
+!/core/tests/fixtures/*.presentation.tlsn
+# SP1 proofs of real sessions can contain witness data (e.g. the API key): never commit.
+proof.bin
+# Eval inputs contain zkTLS presentations (with the API key): never commit.
+eval-input.bin
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/*.log
+/fuzz/Cargo.lock
