@@ -74,6 +74,41 @@ impl RootCertStore {
 #[derive(Debug)]
 pub struct ServerCertVerifier {
     roots: Vec<webpki_types::TrustAnchor<'static>>,
+    /// [ph fork] Chains this verifier already accepted: key -> (lo, hi), the
+    /// intersection of the validity windows of every presented certificate.
+    /// See `verify_server_cert` for why a hit is sound.
+    verified: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], (u64, u64)>>,
+}
+
+/// [ph fork] Cache key: the exact presented chain and server name.
+fn chain_key(end_entity: &CertificateDer, intermediates: &[CertificateDer], server_name: &ServerName) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"ph/tlsn-fork/verified-chain/v1");
+    let mut field = |b: &[u8]| {
+        h.update((b.len() as u64).to_le_bytes());
+        h.update(b);
+    };
+    let ServerName::Dns(name) = server_name;
+    field(name.as_str().as_bytes());
+    field(&end_entity.0);
+    field(&(intermediates.len() as u64).to_le_bytes());
+    for c in intermediates {
+        field(&c.0);
+    }
+    h.finalize().into()
+}
+
+/// [ph fork] (notBefore, notAfter) of a DER certificate in Unix seconds, or
+/// None if it does not parse (then nothing is cached: fail safe).
+fn validity_window(der: &[u8]) -> Option<(u64, u64)> {
+    use x509_cert::der::Decode;
+    let c = x509_cert::Certificate::from_der(der).ok()?;
+    let v = &c.tbs_certificate.validity;
+    Some((
+        v.not_before.to_unix_duration().as_secs(),
+        v.not_after.to_unix_duration().as_secs(),
+    ))
 }
 
 impl ServerCertVerifier {
@@ -94,7 +129,10 @@ impl ServerCertVerifier {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Self { roots })
+        Ok(Self {
+            roots,
+            verified: Default::default(),
+        })
     }
 
     /// Creates a server certificate verifier with Mozilla root certificates.
@@ -106,6 +144,7 @@ impl ServerCertVerifier {
     pub fn mozilla() -> Self {
         Self {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            verified: Default::default(),
         }
     }
 
@@ -118,7 +157,51 @@ impl ServerCertVerifier {
     /// * `intermediates` - Intermediate certificates to a trust anchor.
     /// * `server_name` - Server DNS name.
     /// * `time` - Unix time the certificate was presented.
+    ///
+    /// [ph fork] Verified-chain cache. Inside the zkVM one session verifies the
+    /// same chain once per call (about 15 M cycles each for a P-384 intermediate,
+    /// which SP1 has no precompile for). After a full verification succeeds, the
+    /// exact (chain, server name) is remembered with `[lo, hi]` = the
+    /// intersection of the validity windows of *every presented* certificate.
+    /// A later call with the same chain and name at a time `t` in `[lo, hi]` is
+    /// accepted without re-verifying. That is exactly the full result:
+    /// - the path webpki accepted earlier uses only presented certificates plus
+    ///   a trust anchor of this verifier;
+    /// - signatures, basic constraints, key usage, name constraints and the
+    ///   subject-name check do not depend on time; validity windows are the only
+    ///   time-dependent check (no revocation is configured), and trust anchors
+    ///   carry none;
+    /// - every presented certificate is valid at `t`, so that same path is valid
+    ///   at `t`, and the full verification would accept.
+    /// Any miss (other chain, name or time) falls back to full verification.
     pub fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer,
+        intermediates: &[CertificateDer],
+        server_name: &ServerName,
+        time: u64,
+    ) -> Result<(), ServerCertVerifierError> {
+        let key = chain_key(end_entity, intermediates, server_name);
+        if let Some(&(lo, hi)) = self.verified.lock().unwrap().get(&key) {
+            if lo <= time && time <= hi {
+                return Ok(());
+            }
+        }
+        self.verify_server_cert_uncached(end_entity, intermediates, server_name, time)?;
+        let window = std::iter::once(end_entity)
+            .chain(intermediates)
+            .map(|c| validity_window(&c.0))
+            .try_fold((0u64, u64::MAX), |(lo, hi), w| {
+                w.map(|(nb, na)| (lo.max(nb), hi.min(na)))
+            });
+        if let Some(w) = window {
+            self.verified.lock().unwrap().insert(key, w);
+        }
+        Ok(())
+    }
+
+    /// The upstream verification (no cache).
+    pub fn verify_server_cert_uncached(
         &self,
         end_entity: &CertificateDer,
         intermediates: &[CertificateDer],
@@ -140,7 +223,7 @@ impl ServerCertVerifier {
         let time = webpki_types::UnixTime::since_unix_epoch(Duration::from_secs(time));
 
         cert.verify_for_usage(
-            webpki::ALL_VERIFICATION_ALGS,
+            ph_webpki_algs::ALL_VERIFICATION_ALGS, // [ph fork] was ring-backed
             &self.roots,
             &intermediates,
             time,
