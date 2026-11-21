@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["core", "host", "webpki-algs"]
+# The SP1 guest is its own workspace (own lockfile, crypto precompile patches)
+# and is compiled for riscv64im-succinct-zkvm-elf by host/build.rs.
+exclude = ["program", "vendor", "zktls"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+debug = 1
+
+# Keep the host's native replay fast in tests.
+[profile.dev.package."*"]
+opt-level = 3

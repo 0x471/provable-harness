@@ -1,0 +1,7 @@
+# Host toolchain pinned to the same Rust release as the SP1 guest toolchain
+# (`rustup run succinct rustc --version` -> 1.93.0-dev), so host and guest builds
+# of ph-core share std's formatting/Unicode tables and replay identically.
+[toolchain]
+channel = "1.93.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
