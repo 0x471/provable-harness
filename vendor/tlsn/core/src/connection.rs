@@ -341,13 +341,16 @@ impl HandshakeData {
         message.extend_from_slice(server_random);
         message.extend_from_slice(&server_ephemeral_key.kx_params());
 
-        use webpki::ring as alg;
+        use ph_webpki_algs as alg; // [ph fork] was `webpki::ring`
         let sig_alg = match self.sig.alg {
             SignatureAlgorithm::ECDSA_NISTP256_SHA256 => alg::ECDSA_P256_SHA256,
             SignatureAlgorithm::ECDSA_NISTP256_SHA384 => alg::ECDSA_P256_SHA384,
             SignatureAlgorithm::ECDSA_NISTP384_SHA256 => alg::ECDSA_P384_SHA256,
             SignatureAlgorithm::ECDSA_NISTP384_SHA384 => alg::ECDSA_P384_SHA384,
-            SignatureAlgorithm::ED25519 => alg::ED25519,
+            // [ph fork] Ed25519 unsupported by ph-webpki-algs: fail closed.
+            SignatureAlgorithm::ED25519 => {
+                return Err(HandshakeVerificationError::InvalidServerSignature);
+            }
             SignatureAlgorithm::RSA_PKCS1_2048_8192_SHA256 => alg::RSA_PKCS1_2048_8192_SHA256,
             SignatureAlgorithm::RSA_PKCS1_2048_8192_SHA384 => alg::RSA_PKCS1_2048_8192_SHA384,
             SignatureAlgorithm::RSA_PKCS1_2048_8192_SHA512 => alg::RSA_PKCS1_2048_8192_SHA512,
