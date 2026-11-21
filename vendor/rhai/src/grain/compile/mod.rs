@@ -1,0 +1,3007 @@
+#![cfg(not(feature = "no_ast"))]
+
+mod cases;
+mod poolable;
+mod slots;
+
+#[cfg(feature = "no_std")]
+use std::prelude::v1::*;
+
+use crate::ast::{
+    ASTFlags, ASTNode, Expr, FlowControl, FnCallExpr, OpAssignment, Stmt, StmtBlock,
+    SwitchCasesCollection,
+};
+#[cfg(not(feature = "no_closure"))]
+use crate::engine::KEYWORD_IS_SHARED;
+use crate::engine::{KEYWORD_FN_PTR_CALL, KEYWORD_FN_PTR_CURRY};
+#[cfg(not(feature = "no_function"))]
+use crate::func::{ScriptFuncDef, ScriptFuncPayload};
+use crate::types::{Span, Token};
+use crate::{Dynamic, FnAccess, ImmutableString, Position, AST};
+
+use crate::grain::bytecode::code::{assemble, resolve_switch_targets};
+#[cfg(not(feature = "no_custom_syntax"))]
+use crate::grain::bytecode::CustomSyntaxSite;
+use crate::grain::bytecode::{
+    constant_caps, AssignOp, Chain, Chunk, Op, Positions, Receiver, Root, Step, StepFlags, Switch,
+    SwitchRange, Tail,
+};
+use crate::grain::compile::poolable::is_poolable;
+use crate::grain::compile::slots::Slots;
+use crate::grain::format::Caps;
+use crate::grain::program::{Function, Parts, Program};
+
+/// Whether a variable reference is module-qualified, as in `foo::bar`.
+///
+/// `Expr::Variable`'s payload only carries a `Namespace` when modules are
+/// compiled in. Under `no_module` the box is two fields rather than four and
+/// nothing can be qualified, so the question has a constant answer and the
+/// field it would have read does not exist.
+#[cfg(not(feature = "no_module"))]
+macro_rules! has_namespace {
+    ($payload:expr) => {
+        !$payload.2.is_empty()
+    };
+}
+#[cfg(feature = "no_module")]
+macro_rules! has_namespace {
+    ($payload:expr) => {{
+        let _ = $payload;
+        false
+    }};
+}
+
+/// Lowers an [`AST`] into a [`Program`].
+///
+/// Anything not yet lowered is kept as an [`AST`] fragment and handed back to
+/// the interpreter at runtime, so the output always means the same as its input.
+#[derive(Debug, Default, Clone)]
+pub struct Compiler {
+    _private: (),
+}
+
+impl Compiler {
+    /// Create a new [`Compiler`] with default options.
+    #[inline(always)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lower an [`AST`] into a [`Program`].
+    #[must_use]
+    pub fn compile(&self, ast: &AST) -> Program<'static> {
+        let fresh = |caps| Lowering {
+            caps,
+            level: 0,
+            ..Lowering::default()
+        };
+
+        let mut lowering = fresh(Caps::empty());
+
+        // Anything the slot model cannot account for costs the whole program
+        // its lowering rather than risking a scope it resolved slots against
+        // being a different shape at runtime. Coverage is preserved either way.
+        if !lowering.program(ast.statements(), true) {
+            lowering = fresh(lowering.caps);
+            lowering.whole_program_residual(ast.statements());
+        }
+        let main_ops = lowering.code.len();
+
+        // Each function's body appends to the same instruction list, so the
+        // whole program assembles as one address space. A function the slot
+        // model cannot handle is simply left out, and Rhai's own copy of it
+        // stays reachable through the library below.
+        #[cfg(not(feature = "no_function"))]
+        let (functions, skipped) = lowering.functions(ast);
+        #[cfg(feature = "no_function")]
+        let (functions, skipped): (Vec<LoweredFn>, usize) = (Vec::new(), 0);
+
+        // Assembly can fail the same way the slot model can, for a script with
+        // more distinct names or constants than a `u16` operand can index — so
+        // it takes the same exit. The fallback is a single instruction and
+        // always assembles, which is what keeps coverage total.
+        // Switch targets are instruction indices too, and they live in the
+        // pool rather than in the code, so they are resolved separately —
+        // failing the same way, into the same fallback.
+        let assembled = match assemble(&lowering.code) {
+            Ok((code, offsets)) => resolve_switch_targets(&mut lowering.switches, &offsets)
+                .ok()
+                .map(|()| (code, offsets)),
+            Err(..) => None,
+        };
+        let (code, offsets, main_ops, functions, skipped) = match assembled {
+            Some((code, offsets)) => (code, offsets, main_ops, functions, skipped),
+            None => {
+                lowering = fresh(lowering.caps);
+                lowering.whole_program_residual(ast.statements());
+                let (code, offsets) =
+                    assemble(&lowering.code).expect("the fallback is one instruction");
+                (code, offsets, lowering.code.len(), Vec::new(), 1)
+            }
+        };
+
+        // Jump targets and the position table were both keyed on instruction
+        // index while lowering; instructions vary in length once assembled.
+        let mut positions = vec![crate::Position::NONE; code.len()];
+        for (index, pos) in lowering.positions.iter().enumerate() {
+            positions[offsets[index] as usize] = *pos;
+        }
+
+        let main = Chunk::new(0, offsets[main_ops], lowering.max_stack);
+        let functions: Vec<_> = functions
+            .into_iter()
+            .map(|f| Function {
+                name: f.name,
+                params: f.params,
+                this_type: f.this_type,
+                access: f.access,
+                chunk: Chunk::new(
+                    offsets[f.first_op],
+                    offsets[f.first_op + f.op_count],
+                    lowering.max_stack,
+                ),
+            })
+            .collect();
+
+        #[cfg(not(feature = "no_custom_syntax"))]
+        let custom_syntax: Vec<_> = lowering
+            .custom_syntax
+            .into_iter()
+            .map(|site| CustomSyntaxSite {
+                key: site.key,
+                state: site.state,
+                inputs: site
+                    .inputs
+                    .into_iter()
+                    .map(|(chunk, literal)| {
+                        (
+                            Chunk::new(
+                                offsets[chunk.entry() as usize],
+                                offsets[chunk.end() as usize],
+                                lowering.max_stack,
+                            ),
+                            literal,
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        #[cfg(feature = "no_custom_syntax")]
+        let custom_syntax = Vec::new();
+
+        let caps = lowering.caps;
+
+        // Rhai's own functions are carried whenever anything might still reach
+        // for them: a function this compiler skipped, or a fragment that could
+        // call one. With neither, every call resolves in the table above and
+        // the library — an `AST`'s whole function tree — can be dropped.
+        #[cfg(not(feature = "no_function"))]
+        let lib = {
+            let needs_walker = skipped > 0 || !lowering.residuals.is_empty();
+            (needs_walker && !ast.shared_lib().is_empty()).then(|| ast.shared_lib().clone())
+        };
+        // Under `no_function` there is no function tree to carry, whichever way
+        // the fallbacks above went.
+        #[cfg(feature = "no_function")]
+        let lib = {
+            let _ = skipped;
+            None
+        };
+
+        let mut program = Program::new(
+            caps,
+            code.into(),
+            main,
+            functions,
+            Parts {
+                positions: Positions::dense(positions),
+                // Derived from what is being compiled in.
+                debug_id: None,
+                residuals: lowering.residuals,
+                consts: lowering.consts,
+                names: crate::grain::bytecode::Strings::new(&lowering.names),
+                tokens: lowering.tokens,
+                assign_ops: lowering.assign_ops,
+                chains: lowering.chains,
+                switches: lowering.switches,
+                custom_syntax,
+                lib,
+                #[cfg(not(feature = "no_module"))]
+                resolver: ast.resolver.clone(),
+                source: ast.source().map(Into::into),
+            },
+        );
+
+        // `max_stack` above is an upper bound the lowering can compute without
+        // a depth walk. The verifier does the walk anyway, so take its answer.
+        program.tighten_stack();
+        program
+    }
+}
+
+/// Where `break` and `continue` jump to, and what they must unwind first.
+///
+/// Jump targets are backpatched: `break` sites are collected as they are
+/// emitted and pointed at the instruction after the loop once that address is
+/// known.
+struct Loop {
+    /// Where `continue` goes — the condition test, or the top of the body.
+    continue_target: u32,
+    /// Slot depth a `break` unwinds to. For a `for` loop this is *before* the
+    /// loop variable, which leaving must drop.
+    break_depth: u16,
+    /// Slot depth a `continue` unwinds to. Differs from `break_depth` in a
+    /// `for`, where the loop variable has to survive into the next iteration —
+    /// one field cannot be both.
+    continue_depth: u16,
+    /// How many iterators are live *inside* this loop, so a jump out of it
+    /// can drop whatever was made since. A `break` inside a `try` inside a
+    /// `for` skips the straight-line path that would have cleaned up.
+    iters: usize,
+    /// Whether the loop owns an iterator of its own. `break` drops it and
+    /// `continue` must not, which is the other thing one field cannot be.
+    owns_iterator: bool,
+    /// How many `try` regions were armed when the loop began, so a jump out
+    /// of the loop disarms the ones inside it.
+    handlers: usize,
+    /// How many surplus stack slots enclosed this loop when it began, so a
+    /// jump out of the loop can drop them on the stack.
+    stack_surplus: usize,
+    /// `Jump` sites awaiting the address after the loop.
+    breaks: Vec<usize>,
+    /// Whether any `break` statement in this loop yields an expression value.
+    has_break_value: bool,
+}
+
+/// Where a `switch` table entry sends control, before the arms have
+/// addresses.
+#[derive(Debug, Clone, Copy)]
+enum Entry {
+    /// Straight to an arm's body: the group has no guard to try first.
+    Body(usize),
+    /// The head of a guard chain, which is already emitted.
+    At(u32),
+    /// Nothing in the group can run.
+    Default,
+}
+
+/// What lowering a statement left on the operand stack.
+///
+/// Every Rhai statement has a value, but most of them have the *same* value:
+/// a declaration, an assignment and a `share` are all unit. Saying so here is
+/// what lets the caller materialize that unit only where it is read — as a
+/// block's value — rather than pushing and popping one per statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum Lowered {
+    /// One value, which the statement pushed itself.
+    Value,
+    /// Nothing. Either the statement's value is unit, or control left before
+    /// reaching its end — for the caller the two mean the same thing: what
+    /// follows starts at the depth the statement began at.
+    Empty,
+    /// The slot model could not account for it, so the caller falls back.
+    Defeated,
+}
+
+/// A function body that lowered, before its instruction indices become byte
+/// addresses.
+struct LoweredFn {
+    name: u32,
+    params: Vec<u32>,
+    access: FnAccess,
+    /// The declared receiver type, as a name-pool index. See
+    /// [`Function::this_type`](crate::grain::program::Function::this_type).
+    this_type: Option<u32>,
+    first_op: usize,
+    op_count: usize,
+}
+
+#[derive(Default)]
+struct Lowering {
+    /// Capabilities required by the instructions emitted so far.
+    /// The compiler does not know what the caller will do with the output,
+    /// so it has to assume the worst and report everything it uses.
+    caps: Caps,
+    code: Vec<Op>,
+    /// One per instruction, parallel to `code`. Most are `NONE`; the dense
+    /// shape is what makes a lookup an index, and it compacts on the way out.
+    positions: Vec<Position>,
+    residuals: Vec<Expr>,
+    consts: Vec<Dynamic>,
+    names: Vec<ImmutableString>,
+    tokens: Vec<Token>,
+    assign_ops: Vec<AssignOp>,
+    chains: Vec<Chain>,
+    switches: Vec<Switch>,
+    #[cfg(not(feature = "no_custom_syntax"))]
+    custom_syntax: Vec<CustomSyntaxSite>,
+    slots: Slots,
+    /// What level the statement currently being lowered belongs at:
+    /// the global level is level zero.
+    level: usize,
+    max_stack: u16,
+    loops: Vec<Loop>,
+    /// How many iterators are live at this point in the lowering, so a jump
+    /// out of a loop knows how many to drop.
+    iters: usize,
+    /// The same for `try` regions: a `break` out of one has to disarm it, or
+    /// the next unrelated error is caught into a block already left.
+    handlers: usize,
+    /// How many surplus stack slots enclose this point in the lowering, so a
+    /// `break` out of a loop knows how many stack slots to drop.
+    stack_surplus: usize,
+    /// How many statements enclose the one being lowered, for the marker
+    /// [`Lowering::statement`] emits. Restored on the way out, so it is the
+    /// nesting rather than a running count.
+    #[cfg(feature = "debugging")]
+    stmt_depth: u16,
+    /// Set when something nested inside an expression defeated the slot model.
+    ///
+    /// [`Lowering::statement`] says so by returning false, but
+    /// [`Lowering::expression`] has no way to: it is called from the middle of
+    /// building other expressions, and every one of those callers would have
+    /// to thread the answer back. So a block used as an expression records the
+    /// failure here instead, and [`Lowering::program`] reports it.
+    ///
+    /// A sticky flag is enough because failure is all or nothing — the caller
+    /// throws the whole lowering away and starts again as one fragment — so
+    /// instructions emitted after it are discarded rather than run.
+    defeated: bool,
+}
+
+impl Lowering {
+    /// Lower a statement list as a whole chunk. Returns false if something
+    /// defeated the slot model and the caller should fall back.
+    ///
+    /// `keeps_scope` says whether what this chunk declares outlives it, which
+    /// is true of the program and false of every function body. Only then is a
+    /// [`Op::Checkpoint`] worth emitting: it is what an escaping error unwinds
+    /// to, and a function's scope is discarded whole however it ends.
+    fn program(&mut self, statements: &[Stmt], keeps_scope: bool) -> bool {
+        let Some((last, leading)) = statements.split_last() else {
+            self.emit(Op::Unit);
+            self.emit(Op::Return);
+            return true;
+        };
+
+        for stmt in leading {
+            if keeps_scope {
+                self.emit(Op::Checkpoint);
+            }
+            match self.statement(stmt) {
+                Lowered::Defeated => return false,
+                // A statement's value is only the program's value if it is the
+                // last one; Rhai discards the rest.
+                Lowered::Value => self.emit(Op::Pop),
+                Lowered::Empty => {}
+            }
+        }
+
+        if keeps_scope {
+            self.emit(Op::Checkpoint);
+        }
+        match self.statement(last) {
+            Lowered::Defeated => return false,
+            // [`Op::Return`] takes the frame's value off the stack, so the unit
+            // an empty statement stands for has to be there.
+            Lowered::Empty => self.emit(Op::Unit),
+            Lowered::Value => {}
+        }
+
+        self.emit(Op::Return);
+        !self.defeated
+    }
+
+    /// Lower `a.b[i].c`, either reading it or assigning to it.
+    ///
+    /// Returns false if the chain is not one this can express, in which case
+    /// the caller keeps it as a fragment.
+    ///
+    /// The shape is the awkward part. Rhai does not store a chain as a list:
+    /// `a.b[i]` is `Dot { lhs: a, rhs: Index { lhs: b, rhs: i } }`, where each
+    /// nested node's `lhs` is the *current* step's operand and its `rhs` is the
+    /// continuation. [`flatten_chain`] unpicks that into steps.
+    fn chain(&mut self, expr: &Expr, tail: Tail, value: Option<&Expr>) -> bool {
+        let Some((root, steps)) = flatten_chain(self, expr) else {
+            return false;
+        };
+
+        // A variable root is one the chain can write back into, by slot or by
+        // name; anything else has to be both a read and a value Rhai would
+        // itself have evaluated into a temporary.
+        //
+        // `this` is deliberately not in the second class. Rhai reaches it
+        // through the caller's `&mut`, so a method step that mutates lands in
+        // the caller's value — walking a copy would drop the write silently.
+        // It gets a root of its own instead.
+        let root_spec = match root {
+            Expr::Variable(v, ..) if !has_namespace!(v) => match self.slots.resolve(&v.1) {
+                Some(slot) => Root::Local {
+                    slot,
+                    name: self.push_name(v.1.clone()),
+                },
+                // The caller's, or a module's, or nothing — decided at run
+                // time, because which of the three it is decides whether the
+                // chain can write through it.
+                //
+                // The guard is load-bearing: a bare script-function name is a
+                // function pointer rather than a variable, and turning one
+                // into a name lookup would report it missing where Rhai hands
+                // back a pointer.
+                None if self.is_variable_name(false) => Root::Named {
+                    name: self.push_name(v.1.clone()),
+                    pos: root.position(),
+                },
+                None => unreachable!("case above is always taken"),
+            },
+            Expr::ThisPtr(pos) => {
+                self.caps.insert(Caps::THIS);
+                Root::This { pos: *pos }
+            }
+            _ if matches!(tail, Tail::Read) => Root::Temporary,
+            // Unreachable through the parser, which refuses `f().x = 1` outright.
+            _ => return false,
+        };
+
+        // Evaluate the assignment value first, so the chain can read it back
+        // after the lvalue steps have been resolved.
+
+        // The chain is a single expression, so the value is evaluated before
+        // the root and steps.
+
+        let rewind_mark = self.mark();
+
+        if let Some(value) = value {
+            // First evaluate the assigned value first, stash it so the chain
+            // can read it back after the lvalue steps have been resolved.
+            self.expression(value);
+        }
+
+        // Index values and method arguments are evaluated first, in step
+        // order, exactly as Rhai collects them before walking.
+        // Evaluating one partway down would need the operand stack while
+        // a borrow of the container is live.
+        let mut lowered = Vec::with_capacity(steps.len());
+        let mut operands = 0u16;
+
+        for step in &steps {
+            match step {
+                ChainStep::Index(index, bracket, flags) => {
+                    self.caps.insert(Caps::INDEXING);
+                    self.expression(index);
+                    lowered.push(Step::Index {
+                        operand: operands,
+                        flags: *flags,
+                        pos: index.start_position(),
+                        bracket: *bracket,
+                    });
+                    operands += 1;
+                }
+                ChainStep::Property(prop, pos, flags) => {
+                    self.caps.insert(Caps::PROPERTY);
+                    let (getter, setter, name) = &**prop;
+                    lowered.push(Step::Property {
+                        name: self.push_name(name.clone()),
+                        getter: self.push_name(getter.0.clone()),
+                        setter: self.push_name(setter.0.clone()),
+                        flags: *flags,
+                        pos: *pos,
+                    });
+                }
+                ChainStep::Method(call, pos, flags) => {
+                    self.caps.insert(Caps::METHOD);
+                    match call.name.as_str() {
+                        KEYWORD_FN_PTR_CALL => self.caps.insert(Caps::FN_PTR),
+                        KEYWORD_FN_PTR_CURRY => self.caps.insert(Caps::FN_PTR | Caps::CURRYING),
+                        #[cfg(not(feature = "no_closure"))]
+                        KEYWORD_IS_SHARED if call.args.is_empty() => {
+                            self.caps.insert(Caps::SHARING);
+                        }
+                        _ if !self.is_lowerable_call(call) => {
+                            if value.is_some() {
+                                self.rewind(rewind_mark);
+                            }
+                            return false;
+                        }
+                        _ => (),
+                    }
+                    let Ok(argc) = u8::try_from(call.args.len()) else {
+                        if value.is_some() {
+                            self.rewind(rewind_mark);
+                        }
+                        return false;
+                    };
+                    let first = operands;
+                    for arg in call.args.iter() {
+                        self.expression(arg);
+                        operands += 1;
+                    }
+                    lowered.push(Step::Method {
+                        name: self.push_name(call.name.clone()),
+                        argc,
+                        operand: first,
+                        flags: *flags,
+                        pos: *pos,
+                    });
+                }
+            }
+        }
+
+        // Then the root, if it is one that has to be evaluated. After the
+        // operands rather than before, which is Rhai's order and not the
+        // reading order: `[f()][g()]` calls `g` first.
+        if matches!(root_spec, Root::Temporary) {
+            self.expression(root);
+        }
+
+        let index = self.push_chain(Chain {
+            root: root_spec,
+            steps: lowered,
+            tail,
+            operands,
+        });
+        self.emit_at(Op::Chain(index), expr.position());
+        true
+    }
+
+    /// Lower a `switch` into dispatch tables plus the arms they name.
+    ///
+    /// The layout is: evaluate and keep the subject, [`Op::Switch`] over
+    /// hashed cases, a second [`Op::Switch`] over ranges for case misses and
+    /// declined guards, then the arm bodies and default.
+    ///
+    /// Every arm leaves one value and jumps to the end, so the statement's
+    /// value is the matched arm's — or unit, which is what an absent `_`
+    /// compiles to.
+    ///
+    /// Guards are why the table does not simply hold bodies. Rhai tries the
+    /// arms sharing a case value in source order and, when they all decline,
+    /// continues with ranges before the default.
+    ///
+    /// Nearly every arm anyone writes has no guard, and those cost no chain at
+    /// all.
+    fn switch(&mut self, subject: &Expr, sw: &SwitchCasesCollection) -> bool {
+        self.stack_surplus += 1;
+
+        // Overlapping range arms have no single answer at runtime, so they are
+        // cut into disjoint pieces here instead. See [`cases::split`].
+        let ranges = cases::split(&sw.ranges);
+
+        self.expression(subject);
+
+        // The first table is for the hashed case values.
+        let cases_table = self.push_switch();
+        self.emit(Op::Switch(cases_table));
+
+        // One chain per distinct list of arms, shared by every table entry
+        // naming it: `1 | 2 => ..` is two case values and one chain.
+        let mut case_chains: Vec<(&[usize], Entry)> = Vec::new();
+        let mut to_body: Vec<(usize, usize)> = Vec::new();
+        let mut to_ranges: Vec<usize> = Vec::new();
+
+        for blocks in sw.cases.values().map(|case| case.blocks.as_slice()) {
+            if case_chains.iter().any(|(ex, ..)| *ex == blocks) {
+                continue;
+            }
+            let entry = self.arm_chain(sw, blocks, &mut to_body, &mut to_ranges);
+            case_chains.push((blocks, entry));
+        }
+
+        // Dispatch to the ranges table if no case value matches or all the guards decline.
+        // The default arm is only reached when all ranges fail.
+        //
+        // The last chain to decline arrives here by falling off its own end, so
+        // it needs no jump to say so.
+        if !ranges.is_empty() {
+            self.drop_idle_jump(&mut to_ranges);
+        }
+
+        let ranges_dispatch = self.here();
+        let mut to_default: Vec<usize> = Vec::new();
+
+        // One chain per distinct list of ranges, shared by every table entry
+        let mut range_chains: Vec<(&[usize], Entry)> = Vec::new();
+
+        let ranges_table = if !ranges.is_empty() {
+            // The second table is for the ranges.
+            let ranges_table = self.push_switch();
+            self.emit(Op::Switch(ranges_table));
+
+            for blocks in ranges.iter().map(|(.., blocks)| blocks.as_slice()) {
+                if range_chains.iter().any(|(ex, ..)| *ex == blocks) {
+                    continue;
+                }
+                let entry = self.arm_chain(sw, blocks, &mut to_body, &mut to_default);
+                range_chains.push((blocks, entry));
+            }
+
+            ranges_table
+        } else {
+            0
+        };
+
+        // Bodies, one per arm something can reach. An arm behind a constant
+        // false guard, or one whose range the parser dropped for being empty,
+        // is reachable by nothing and is not emitted.
+        let mut wanted: Vec<usize> = to_body.iter().map(|(.., block)| *block).collect();
+        wanted.extend(
+            case_chains
+                .iter()
+                .chain(range_chains.iter())
+                .filter_map(|(.., entry)| match entry {
+                    Entry::Body(block) => Some(*block),
+                    _ => None,
+                }),
+        );
+        wanted.extend(sw.def_case);
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut body_at: Vec<(usize, u32)> = Vec::with_capacity(wanted.len());
+        let mut to_end: Vec<usize> = Vec::with_capacity(wanted.len());
+
+        for block in wanted {
+            body_at.push((block, self.here()));
+            // An arm body is an ordinary expression, and a block one goes
+            // through the same path as `let y = { .. }`.
+            self.expression(&sw.expressions[block].rhs);
+            if self.defeated {
+                self.stack_surplus -= 1;
+                return false;
+            }
+            to_end.push(self.emit_jump());
+        }
+
+        let at = |block: usize| {
+            body_at
+                .iter()
+                .find(|(candidate, ..)| *candidate == block)
+                .map(|(.., at)| *at)
+                .expect("every reachable arm was emitted above")
+        };
+
+        let default_at = match sw.def_case {
+            Some(block) => at(block),
+            None => {
+                let target = self.here();
+                self.emit(Op::Unit);
+                target
+            }
+        };
+
+        // The last body emitted falls into it when there is nothing between the
+        // two — which is every `switch` with a `_` arm, because then the default
+        // is a body already emitted rather than a unit put here.
+        self.drop_idle_jump(&mut to_end);
+        let unwind_at = self.here();
+
+        // At the end of the switch, surface and drop the switch subject value
+        // that was kept on the stack.
+        self.emit(Op::Rotate(1));
+        self.emit(Op::Pop);
+
+        for site in to_end {
+            self.patch_to(site, unwind_at);
+        }
+        if ranges.is_empty() {
+            for site in to_ranges {
+                self.patch_to(site, default_at);
+            }
+        } else {
+            for site in to_ranges {
+                self.patch_to(site, ranges_dispatch);
+            }
+        }
+        for site in to_default {
+            self.patch_to(site, default_at);
+        }
+        for (site, block) in to_body {
+            self.patch_to(site, at(block));
+        }
+
+        let case_target = |blocks: &[usize]| {
+            let entry = case_chains
+                .iter()
+                .find(|(ex, ..)| *ex == blocks)
+                .map(|(.., entry)| *entry)
+                .expect("every list got a chain above");
+
+            match entry {
+                Entry::Body(block) => at(block),
+                Entry::At(target) => target,
+                Entry::Default => {
+                    if ranges.is_empty() {
+                        default_at
+                    } else {
+                        ranges_dispatch
+                    }
+                }
+            }
+        };
+
+        self.switches[cases_table as usize] = Switch {
+            cases: Some(
+                sw.cases
+                    .iter()
+                    .map(|(hash, case)| {
+                        (
+                            *hash,
+                            (
+                                case_target(&case.blocks),
+                                self.push_const(case.value.clone()),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ),
+            ranges: Vec::new(),
+            default: if ranges.is_empty() {
+                default_at
+            } else {
+                ranges_dispatch
+            },
+        };
+
+        if !ranges.is_empty() {
+            let range_target = |blocks: &[usize]| {
+                let entry = range_chains
+                    .iter()
+                    .find(|(ex, ..)| *ex == blocks)
+                    .map(|(.., entry)| *entry)
+                    .expect("every list got a chain above");
+
+                match entry {
+                    Entry::Body(block) => at(block),
+                    Entry::At(target) => target,
+                    Entry::Default => default_at,
+                }
+            };
+
+            self.switches[ranges_table as usize] = Switch {
+                cases: None,
+                ranges: ranges
+                    .iter()
+                    .map(|(range, blocks)| SwitchRange {
+                        target: range_target(blocks),
+                        ..*range
+                    })
+                    .collect(),
+                default: default_at,
+            };
+        }
+
+        self.stack_surplus -= 1;
+
+        true
+    }
+
+    /// Emit the guard chain for one group of arms, and say where the table
+    /// entries naming that group should point.
+    fn arm_chain(
+        &mut self,
+        sw: &SwitchCasesCollection,
+        blocks: &[usize],
+        to_body: &mut Vec<(usize, usize)>,
+        to_fallback: &mut Vec<usize>,
+    ) -> Entry {
+        let mut entry: Option<Entry> = None;
+
+        for block in blocks {
+            match &sw.expressions[*block].lhs {
+                // An arm without an `if` is a literal `true` in the tree,
+                // so it always runs and everything after it in the group
+                // is unreachable.
+                Expr::BoolConstant(true, ..) => {
+                    return match entry {
+                        None => Entry::Body(*block),
+                        Some(entry) => {
+                            to_body.push((self.emit_jump(), *block));
+                            entry
+                        }
+                    };
+                }
+                // Nothing can reach this arm, so nothing is emitted for it.
+                Expr::BoolConstant(false, ..) => continue,
+                guard => {
+                    if entry.is_none() {
+                        entry = Some(Entry::At(self.here()));
+                    }
+                    self.expression(guard);
+                    let site = self.code.len();
+                    // Rhai reports a non-boolean guard against the guard, so
+                    // the jump carries the guard's position.
+                    self.emit_at(Op::JumpIfTrue { target: u32::MAX }, guard.position());
+                    to_body.push((site, *block));
+                }
+            }
+        }
+
+        match entry {
+            Some(entry) => {
+                to_fallback.push(self.emit_jump());
+                entry
+            }
+            // Every arm in the group is behind a constant false guard, so the
+            // group is the default with extra steps.
+            None => Entry::Default,
+        }
+    }
+
+    /// Reserve a table, to be filled in once its arms have addresses.
+    fn push_switch(&mut self) -> u32 {
+        self.switches.push(Switch {
+            cases: None,
+            ranges: Vec::new(),
+            default: 0,
+        });
+        (self.switches.len() - 1) as u32
+    }
+
+    fn push_chain(&mut self, chain: Chain) -> u32 {
+        if let Some(index) = self.chains.iter().position(|existing| *existing == chain) {
+            return index as u32;
+        }
+        self.chains.push(chain);
+        (self.chains.len() - 1) as u32
+    }
+
+    /// Lower every script function the `AST` declares, and count the ones the
+    /// slot model turned down. Sorted for reproducibility.
+    #[cfg(not(feature = "no_function"))]
+    fn functions(&mut self, ast: &AST) -> (Vec<LoweredFn>, usize) {
+        let mut defs: Vec<_> = ast
+            .shared_lib()
+            .iter_script_fn_info()
+            .map(|(.., def)| def)
+            .collect();
+        defs.sort_unstable_by(|a, b| declaration_order(a).cmp(&declaration_order(b)));
+
+        let mut functions = Vec::new();
+        let mut skipped = 0;
+        for def in defs {
+            match self.function(def) {
+                Some(function) => {
+                    functions.push(function);
+                    self.caps.insert(Caps::FUNCTION);
+                }
+                None => skipped += 1,
+            }
+        }
+        (functions, skipped)
+    }
+
+    /// Lower one script function's body into the same instruction list.
+    ///
+    /// Returns `None` if the slot model cannot account for it, in which case
+    /// Rhai keeps its own copy and calls to it go through dispatch.
+    ///
+    /// That is a per-function decision: one awkward function does not cost
+    /// the rest their lowering.
+    ///
+    /// The body runs in a fresh scope with the parameters already pushed,
+    /// so the parameters are exactly slots 0 upwards.
+    #[cfg(not(feature = "no_function"))]
+    fn function(&mut self, def: &ScriptFuncDef) -> Option<LoweredFn> {
+        let first_op = self.code.len();
+        let first_residual = self.residuals.len();
+        let saved_slots = std::mem::take(&mut self.slots);
+        let saved_loops = std::mem::take(&mut self.loops);
+        let saved_level = self.level;
+        self.level += 1;
+        // Per-function, like the slots: one body the model cannot handle must
+        // not cost the rest of the program its lowering.
+        let saved_defeated = std::mem::replace(&mut self.defeated, false);
+
+        for param in def.params.iter() {
+            self.slots.declare(param.clone());
+        }
+        let params: Vec<_> = def
+            .params
+            .iter()
+            .map(|p| self.push_name(p.clone()))
+            .collect();
+
+        let body = match &def.body {
+            // The function's body must be an AST statements block.
+            ScriptFuncPayload::Statements(body) => body,
+            // This should not happen: the only way for a `GrainVM` to appear
+            // is for Grain to generate it inside a callback wrapper.
+            // So Grain should never be handed another Grain function to compile.
+            ScriptFuncPayload::GrainVM { .. } => {
+                unreachable!("AST compiled by Rhai never contains a GrainVM function body")
+            }
+        };
+
+        // Rhai stops once on entering a body, before its first statement, at a
+        // synthetic node placed on the body itself.
+        //
+        // A marker at the same place is that stop, and puts it in the chunk
+        // rather than in the VM. Depth zero, like the statements it precedes:
+        // it does not enclose them, so stepping from here reaches the first one.
+        #[cfg(feature = "debugging")]
+        self.emit_at(Op::Statement { depth: 0 }, body.position());
+
+        // A body is a statement list whose last value is the return value,
+        // which is what `program` already does.
+        let lowered = self.program(body.statements(), false);
+
+        self.slots = saved_slots;
+        self.loops = saved_loops;
+        self.level = saved_level;
+        self.defeated = saved_defeated;
+
+        if !lowered {
+            // Roll back whatever the attempt emitted, so a function that could
+            // not be lowered leaves no unreachable instructions behind.
+            //
+            // The fragments go with the instructions that referred to them.
+            // Rhai keeps its own copy of a body this turned down, so it is the
+            // walker that evaluates what is in there — a fragment left here
+            // would be one nothing can reach, counted against a program that
+            // does not need it. Only this function's are dropped: the ones
+            // below `first_residual` belong to code that is staying.
+            self.code.truncate(first_op);
+            self.positions.truncate(first_op);
+            self.residuals.truncate(first_residual);
+            return None;
+        }
+
+        Some(LoweredFn {
+            name: self.push_name(def.name.clone()),
+            params,
+            access: def.access,
+            // A typed `this` is a method on a custom type, which is exactly
+            // what `no_object` removes — Rhai drops the field with it.
+            #[cfg(not(feature = "no_object"))]
+            this_type: def
+                .this_type
+                .as_ref()
+                .map(|typed| self.push_name(typed.clone())),
+            #[cfg(feature = "no_object")]
+            this_type: None,
+            first_op,
+            op_count: self.code.len() - first_op,
+        })
+    }
+
+    /// The last-resort fallback: one fragment holding everything, evaluated
+    /// without rewinding so top-level declarations still reach the caller.
+    fn whole_program_residual(&mut self, statements: &[Stmt]) {
+        let body = wrap_statements(statements.to_vec());
+        let residual = self.push_residual(body);
+        self.emit(Op::EvalAst {
+            residual,
+            rewind_scope: false,
+        });
+        self.emit(Op::Return);
+    }
+
+    /// Lower one statement, leaving its value on the stack — or saying it left
+    /// none, which is [`Lowered::Empty`].
+    ///
+    /// Marks where it begins first, which is what the debugger stops at — see
+    /// [`Op::Statement`]. Every statement gets one, the ones that end up as
+    /// fragments included: the walker evaluating a fragment stops at its own
+    /// node as well, so such a statement stops twice at the same place. Driving
+    /// the residual count to zero is what removes that.
+    fn statement(&mut self, stmt: &Stmt) -> Lowered {
+        #[cfg(feature = "debugging")]
+        let enclosing = {
+            let depth = self.stmt_depth;
+            self.emit_at(Op::Statement { depth }, stmt.position());
+            // Saturating, so a script nested past 65,535 statements marks its
+            // innermost ones as siblings rather than wrapping the depth into a
+            // shallower one. `max_expr_depth` stops a parse long before.
+            self.stmt_depth = depth.saturating_add(1);
+            depth
+        };
+
+        let lowered = self.lower_statement(stmt);
+
+        #[cfg(feature = "debugging")]
+        {
+            self.stmt_depth = enclosing;
+        }
+
+        lowered
+    }
+
+    /// The lowering itself, one arm per kind of statement.
+    fn lower_statement(&mut self, stmt: &Stmt) -> Lowered {
+        match stmt {
+            // A Noop evaluates to unit.
+            Stmt::Noop(..) => Lowered::Empty,
+
+            Stmt::Var(payload, flags, ..) => {
+                if self.slots.is_full() {
+                    return Lowered::Defeated;
+                }
+                let is_const = flags.contains(ASTFlags::CONSTANT);
+                let (ident, init, index) = &**payload;
+                self.expression(init);
+
+                let slot = if let Some(index) = index {
+                    let slot = self.slots.depth() - index.get();
+                    let slot =
+                        u16::try_from(slot).expect("slot index is within the compiler's range");
+                    self.emit(Op::StoreLocal { slot, is_const });
+                    slot
+                } else {
+                    let name = self.push_name(ident.name.clone());
+                    let slot = self.slots.declare(ident.name.clone());
+                    if is_const && self.level == 0 {
+                        self.emit(Op::DeclareLocal {
+                            name,
+                            is_const,
+                            is_global: true,
+                        });
+                    } else {
+                        self.emit(Op::DeclareLocal {
+                            name,
+                            is_const,
+                            is_global: false,
+                        });
+                    }
+                    slot
+                };
+
+                // `export var`.
+                #[cfg(not(feature = "no_module"))]
+                if flags.contains(ASTFlags::EXPORTED) {
+                    self.caps.insert(Caps::EXPORT);
+                    let alias = self.push_name(ident.name.clone());
+                    self.emit(Op::ExportLocal { slot, alias });
+                }
+                #[cfg(feature = "no_module")]
+                let _ = slot;
+
+                // A declaration evaluates to unit.
+                Lowered::Empty
+            }
+
+            Stmt::Expr(expr) => {
+                self.expression(expr);
+                Lowered::Value
+            }
+
+            // Rhai gives a call standing alone as a statement its own node
+            // rather than wrapping it in `Stmt::Expr`, and an operator is a
+            // call — so without this every top-level `a * b` stayed a fragment.
+            // A closure's `curry` lands here rather than in `Stmt::Expr`,
+            // because Rhai gives a call standing alone as a statement its own
+            // node.
+            Stmt::FnCall(call, pos) if self.fn_ptr_call(call, *pos) => Lowered::Value,
+
+            Stmt::FnCall(call, pos) if self.is_lowerable_call(call) => {
+                self.lower_call(call, *pos);
+                Lowered::Value
+            }
+
+            // Standing alone is the position `eval` is usually written in, and
+            // Rhai gives it its own node — so this is the arm that catches it,
+            // not the `Expr::FnCall` one. See there for why it defeats the
+            // lowering rather than becoming a fragment.
+            Stmt::FnCall(call, ..) if call.name == crate::engine::KEYWORD_EVAL => Lowered::Defeated,
+
+            // `this` on the left. Ahead of the two variable arms because Rhai's
+            // parser puts it there too, and because the chain arm below would
+            // otherwise take `this.x = 1`'s sibling.
+            Stmt::Assignment(payload) if matches!(&payload.1.lhs, Expr::ThisPtr(..)) => {
+                self.caps.insert(Caps::THIS);
+
+                let (op_info, binary) = &**payload;
+
+                // Before the right-hand side, not after. Rhai checks that
+                // `this` is bound and returns before it evaluates the value
+                // — unlike the variable arm, which evaluates first — so an
+                // unbound `this = no_such` is `ErrorUnboundThis` and not the
+                // value's own failure.
+                self.emit_at(Op::RequireThis, binary.lhs.position());
+
+                self.expression(&binary.rhs);
+                let op = self.op_assignment(op_info);
+
+                self.emit_at(Op::AssignThis { op }, op_info.position());
+                Lowered::Empty
+            }
+
+            // A plain local on the left.
+            Stmt::Assignment(payload)
+                if matches!(&payload.1.lhs, Expr::Variable(v, ..)
+                    if !has_namespace!(v) && self.slots.resolve(&v.1).is_some()) =>
+            {
+                let (op_info, binary) = &**payload;
+                let Expr::Variable(v, ..) = &binary.lhs else {
+                    unreachable!("checked by the guard");
+                };
+                let slot = self.slots.resolve(&v.1).expect("checked by the guard");
+                let var_name = self.push_name(v.1.clone());
+
+                self.expression(&binary.rhs);
+                let op = self.op_assignment(op_info);
+
+                self.emit_at(Op::AssignLocal { slot, var_name, op }, op_info.position());
+                Lowered::Empty
+            }
+
+            // A variable no slot names — the caller's. Same shape as above,
+            // and the same op-assignment resolution; only where the target
+            // lives differs.
+            Stmt::Assignment(payload)
+                if matches!(&payload.1.lhs, Expr::Variable(v, ..)
+                    if self.is_variable_name(has_namespace!(v))) =>
+            {
+                let (op_info, binary) = &**payload;
+                let Expr::Variable(v, ..) = &binary.lhs else {
+                    unreachable!("checked by the guard");
+                };
+                let name = self.push_name(v.1.clone());
+
+                self.expression(&binary.rhs);
+                let op = self.op_assignment(op_info);
+
+                // The variable's position, not the operator's — unlike
+                // `AssignLocal`. The errors this instruction raises itself are
+                // `ErrorAssignmentToConstant` and `ErrorVariableNotFound`, and
+                // Rhai reports both against the variable. For a local those are
+                // unreachable, because the parser rejects a constant it can see;
+                // for a name the caller supplied they are the common failures.
+                self.emit_at(Op::AssignNamed { name, op }, binary.lhs.position());
+                Lowered::Empty
+            }
+
+            // A chain on the left. The value goes on the stack after the
+            // chain's own operands, so the walk has everything it needs before
+            // it takes a borrow of the container.
+            Stmt::Assignment(payload)
+                if matches!(&payload.1.lhs, Expr::Dot(..) | Expr::Index(..)) =>
+            {
+                let (op_info, binary) = &**payload;
+                let op = self.op_assignment(op_info);
+
+                let mark = self.mark();
+                if !self.chain(&binary.lhs, Tail::Assign { op }, Some(&binary.rhs)) {
+                    self.rewind(mark);
+                    let residual = self.push_residual(wrap_statements(vec![stmt.clone()]));
+                    self.emit(Op::EvalAst {
+                        residual,
+                        rewind_scope: true,
+                    });
+                }
+                // [`Op::Chain`] leaves one value however it ends, and for an
+                // assigning tail that value is the unit the statement is — so
+                // this arm is a `Value` where the others are `Empty`.
+                Lowered::Value
+            }
+
+            // Emitted by the parser ahead of the `curry` call that binds a
+            // closure's captures.
+            #[cfg(not(feature = "no_closure"))]
+            Stmt::Share(names) => {
+                self.caps.insert(Caps::SHARING);
+
+                for (ident, ..) in names.iter() {
+                    match self.slots.resolve(&ident.name) {
+                        Some(slot) => self.emit_at(Op::Share(slot), ident.pos),
+                        None => {
+                            // The caller's — a closure can capture something
+                            // no slot addresses.
+                            let name = self.push_name(ident.name.clone());
+                            self.emit_at(Op::ShareNamed(name), ident.pos);
+                        }
+                    }
+                }
+                Lowered::Empty
+            }
+
+            // One path in and one out, so the block's own answer is the
+            // statement's — nothing has to be equalized.
+            Stmt::Block(block) => self.block(block.statements()),
+
+            // `try { .. } catch (e) { .. }`.
+            //
+            // The `catch`` block's value is thrown away: Rhai's whole statement
+            // is the try block's value on the way through and *unit* when
+            // something was caught.
+            //
+            // So `try { throw 7 } catch (e) { e * 2 }` is unit, not 14.
+            Stmt::TryCatch(payload, ..) => {
+                let FlowControl { expr, body, branch } = &**payload;
+
+                // An absent catch variable is `Expr::Unit`; a present one is
+                // an `Expr::Variable` whose position is what Rhai reports
+                // `ErrorTooManyVariables` against.
+                let catch_var = match expr {
+                    Expr::Variable(v, ..) => Some(v.1.clone()),
+                    _ => None,
+                };
+
+                let catch_name = catch_var.clone().map(|name| self.push_name(name));
+                let site = self.code.len();
+                self.emit_at(
+                    Op::PushHandler {
+                        target: u32::MAX,
+                        catch_var: catch_name,
+                    },
+                    expr.position(),
+                );
+                self.handlers += 1;
+
+                let lowered = match self.block(body.statements()) {
+                    Lowered::Defeated => return Lowered::Defeated,
+                    lowered => lowered,
+                };
+                self.emit(Op::PopHandler);
+                self.handlers -= 1;
+                let past = self.emit_jump();
+
+                // The catch block, entered with the scope back where the `try`
+                // began and the variable already pushed on top of it. The
+                // handler is still armed here — that is what makes a bare
+                // `throw;` in this block a re-raise — so the depth goes back
+                // up, and the `PopHandler` below is what ends the region.
+                self.patch_to(site, self.here());
+                self.handlers += 1;
+                let depth = self.slots.depth();
+                if let Some(name) = catch_var {
+                    self.slots.declare(name);
+                }
+                match self.block(branch.statements()) {
+                    Lowered::Defeated => return Lowered::Defeated,
+                    Lowered::Value => self.emit(Op::Pop),
+                    Lowered::Empty => {}
+                }
+                self.unwind_to(depth);
+                self.emit(Op::PopHandler);
+                self.handlers -= 1;
+                // Both paths meet at `past`, so the catch path has to leave the
+                // stack the same depth the try path did — and the try body is
+                // the one whose value the statement takes.
+                if let Lowered::Value = lowered {
+                    self.emit(Op::Unit);
+                }
+
+                self.patch_here(past);
+                lowered
+            }
+
+            // `for x in seq` / `for (x, i) in seq`.
+            //
+            // The loop variable and counter are pushed once and written each
+            // time round, not re-pushed — Rhai does the same, and it is observable:
+            // a closure made in the body captures the cell, so every one of them
+            // sees the last value.
+            Stmt::For(payload, ..) => {
+                let (var, counter, flow) = &**payload;
+                let outside = u16::try_from(self.slots.depth()).expect("slot count is bounded");
+
+                self.expression(&flow.expr);
+                // `ErrorFor` is reported against the iterable's *start*, which
+                // for `a.b` or a call is not its `position`.
+                self.emit_at(Op::IterInit, flow.expr.start_position());
+                self.iters += 1;
+
+                // Counter first, matching the order Rhai pushes them in, so
+                // the slots line up with the scope it builds.
+                let counter_slot = counter.as_ref().map(|ident| {
+                    let name = self.push_name(ident.name.clone());
+                    self.emit(Op::Unit);
+                    self.emit(Op::DeclareLocal {
+                        name,
+                        is_const: false,
+                        is_global: false,
+                    });
+                    self.slots.declare(ident.name.clone());
+                    self.slots.depth() as u16 - 1
+                });
+                let var_name = self.push_name(var.name.clone());
+                self.emit(Op::Unit);
+                self.emit(Op::DeclareLocal {
+                    name: var_name,
+                    is_const: false,
+                    is_global: false,
+                });
+                self.slots.declare(var.name.clone());
+                let var_slot = self.slots.depth() as u16 - 1;
+
+                self.emit_at(Op::Tick, flow.body.position());
+
+                let top = self.here();
+                let exit = self.code.len();
+                self.emit_at(
+                    Op::IterNext {
+                        exit: u32::MAX,
+                        counter_slot,
+                    },
+                    flow.expr.position(),
+                );
+                // The item is on the operand stack.
+                self.emit(Op::StoreShared(var_slot));
+
+                let has_break_val = flow.body.statements().iter().any(has_break_value);
+                self.begin_for(top, outside, has_break_val);
+                if !self.block_discarding(flow.body.statements()) {
+                    return Lowered::Defeated;
+                }
+                self.emit(Op::Jump(top));
+                let breaks = self.end_loop();
+
+                // Exhausted: `IterNext` dropped the iterator on the way here.
+                self.patch_to(exit, self.here());
+                self.iters -= 1;
+                self.emit(Op::UnwindTo(outside));
+                self.slots.unwind_to(outside as usize);
+
+                self.exit_loop(breaks, has_break_val)
+            }
+
+            // Every arm is an expression and the default is a `Unit`, so a
+            // `switch` always leaves one.
+            Stmt::Switch(payload, ..) => {
+                let (subject, cases) = &**payload;
+                if self.switch(subject, cases) {
+                    Lowered::Value
+                } else {
+                    Lowered::Defeated
+                }
+            }
+
+            Stmt::If(payload, ..) => {
+                let FlowControl { expr, body, branch } = &**payload;
+
+                self.expression(expr);
+                let to_else = self.emit_jump_if_false(expr.position());
+
+                let then_branch = match self.block(body.statements()) {
+                    Lowered::Defeated => return Lowered::Defeated,
+                    lowered => lowered,
+                };
+
+                // An `if` with no `else` has an empty branch, which emits
+                // nothing — so unless a unit has to be put there for the `then`
+                // path to skip, there is nothing between this jump and where it
+                // would land. Reserved before the branch rather than deleted
+                // after it: `to_else` is patched past this slot, and dropping an
+                // instruction it has already been pointed over would leave that
+                // target one instruction long.
+                let past_else = (!branch.statements().is_empty()
+                    || matches!(then_branch, Lowered::Value))
+                .then(|| self.emit_jump());
+
+                self.patch_here(to_else);
+                let else_branch = match self.block(branch.statements()) {
+                    Lowered::Defeated => return Lowered::Defeated,
+                    lowered => lowered,
+                };
+
+                // The two branches meet at the same address, so they have to
+                // arrive at the same depth. An `else` short of a value takes
+                // one straight after itself, being last; a `then` short of one
+                // needs a trailer past the `else`, and the jump around it is
+                // what that costs. Neither is reached by an `if` whose branches
+                // already agree, which is nearly all of them — including the
+                // `if` with no `else` at all, where the missing branch is an
+                // empty block and both sides are `Empty`.
+                match (then_branch, else_branch) {
+                    (Lowered::Value, Lowered::Empty) => {
+                        self.emit(Op::Unit);
+                        self.patch_here_if(past_else);
+                        Lowered::Value
+                    }
+                    (Lowered::Empty, Lowered::Value) => {
+                        let past_trailer = self.emit_jump();
+                        self.patch_here_if(past_else);
+                        self.emit(Op::Unit);
+                        self.patch_here(past_trailer);
+                        Lowered::Value
+                    }
+                    (Lowered::Value, Lowered::Value) => {
+                        self.patch_here_if(past_else);
+                        Lowered::Value
+                    }
+                    (Lowered::Empty, Lowered::Empty) => {
+                        self.patch_here_if(past_else);
+                        Lowered::Empty
+                    }
+                    (Lowered::Defeated, _) | (_, Lowered::Defeated) => {
+                        unreachable!("both branches returned above")
+                    }
+                }
+            }
+
+            // `loop` and `while true` are the same node: Rhai marks an
+            // unconditional loop with a unit or `true` guard.
+            Stmt::While(payload, ..) => {
+                let FlowControl { expr, body, .. } = &**payload;
+                let unconditional = matches!(expr, Expr::Unit(..) | Expr::BoolConstant(true, ..));
+
+                self.emit_at(Op::Tick, body.position());
+
+                let top = self.here();
+
+                let exit = if unconditional {
+                    None
+                } else {
+                    self.expression(expr);
+                    Some(self.emit_jump_if_false(expr.position()))
+                };
+
+                let has_break_val = body.statements().iter().any(has_break_value);
+                self.begin_loop(top, has_break_val);
+                if !self.block_discarding(body.statements()) {
+                    return Lowered::Defeated;
+                }
+                self.emit(Op::Jump(top));
+
+                let breaks = self.end_loop();
+                if let Some(exit) = exit {
+                    self.patch_here(exit);
+                }
+                self.exit_loop(breaks, has_break_val)
+            }
+
+            Stmt::Do(payload, flags, ..) => {
+                let FlowControl { expr, body, .. } = &**payload;
+                let until = flags.contains(ASTFlags::NEGATED);
+
+                self.emit_at(Op::Tick, body.position());
+
+                let top = self.here();
+
+                let has_break_val = body.statements().iter().any(has_break_value);
+                self.begin_loop(top, has_break_val);
+                if !self.block_discarding(body.statements()) {
+                    return Lowered::Defeated;
+                }
+                let breaks = self.end_loop();
+
+                self.expression(expr);
+                if until {
+                    // `do ... until c` loops while `c` is false, which is a
+                    // false-jump straight back to the top.
+                    self.emit_at(Op::JumpIfFalse { target: top }, expr.position());
+                } else {
+                    let exit = self.emit_jump_if_false(expr.position());
+                    self.emit(Op::Jump(top));
+                    self.patch_here(exit);
+                }
+
+                self.exit_loop(breaks, has_break_val)
+            }
+
+            Stmt::BreakLoop(value, flags, ..) => {
+                let Some(active) = self.loops.last() else {
+                    // Outside any loop this is a parse error in Rhai, so it
+                    // should be unreachable; bail rather than emit a jump to
+                    // nowhere.
+                    return Lowered::Defeated;
+                };
+                let continue_target = active.continue_target;
+                let loop_iters = active.iters;
+                let loop_handlers = active.handlers;
+                let owns_iterator = active.owns_iterator;
+                let (break_depth, continue_depth) = (active.break_depth, active.continue_depth);
+                let pop_surplus = self.stack_surplus - active.stack_surplus;
+                let is_break = flags.contains(ASTFlags::BREAK);
+
+                // A jump out of a loop skips whatever the straight-line path
+                // would have cleaned up. The nesting is lexical, so how many
+                // iterators are live is known here — a `break` inside a `try`
+                // inside a `for` has one to drop, and `continue` has none
+                // because it re-enters the loop that owns it.
+                //
+                // Any stack surplus needs to pop.
+                if is_break {
+                    // If there is a break value, it must first be rotated beyond
+                    // any switch subjects still on the stack.
+                    //
+                    // `Op::Rotate` can only handle up to 255 slots.
+                    let Ok(stack_surplus) = u8::try_from(pop_surplus) else {
+                        return Lowered::Defeated;
+                    };
+                    match value {
+                        Some(expr) => {
+                            self.expression(expr);
+                            self.emit(Op::Rotate(stack_surplus));
+                        }
+                        None if active.has_break_value => {
+                            self.emit(Op::Unit);
+                            self.emit(Op::Rotate(stack_surplus));
+                        }
+                        None => {}
+                    }
+                    for _ in 0..stack_surplus {
+                        self.emit(Op::Pop);
+                    }
+
+                    // Out of the loop entirely, so its own iterator goes too —
+                    // `loop_iters` counts from inside the loop and therefore
+                    // already includes it.
+                    self.pop_handlers(loop_handlers);
+                    self.drop_iterators(loop_iters - usize::from(owns_iterator));
+                    self.emit(Op::UnwindTo(break_depth));
+                    let site = self.emit_jump();
+                    self.loops.last_mut().expect("checked").breaks.push(site);
+                } else {
+                    for _ in 0..pop_surplus {
+                        self.emit(Op::Pop);
+                    }
+                    // Back into the same loop, so its iterator and its loop
+                    // variable both have to survive.
+                    self.pop_handlers(loop_handlers);
+                    self.drop_iterators(loop_iters);
+                    self.emit(Op::UnwindTo(continue_depth));
+                    self.emit(Op::Jump(continue_target));
+                }
+
+                // Control left with the jump above, so nothing here falls
+                // through to the caller.
+                Lowered::Empty
+            }
+
+            // `throw` shares this node, flagged, and unwinds as an error
+            // rather than returning. The position is the keyword's, not the
+            // expression's.
+            Stmt::Return(value, flags, pos) if flags.contains(ASTFlags::BREAK) => {
+                match value {
+                    Some(expr) => self.expression(expr),
+                    None => self.emit(Op::Unit),
+                }
+                self.emit_at(Op::Throw, *pos);
+                // The error unwinds from here, so nothing falls through.
+                Lowered::Empty
+            }
+
+            Stmt::Return(value, flags, ..) if !flags.contains(ASTFlags::BREAK) => {
+                match value {
+                    Some(expr) => self.expression(expr),
+                    None => self.emit(Op::Unit),
+                }
+                self.emit(Op::Return);
+                Lowered::Empty
+            }
+
+            #[cfg(not(feature = "no_module"))]
+            Stmt::Export(payload, ..) => {
+                self.caps.insert(Caps::EXPORT);
+
+                let (ident, alias) = &**payload;
+
+                let alias_name = if alias.name.is_empty() {
+                    ident.name.clone()
+                } else {
+                    alias.name.clone()
+                };
+                let alias = self.push_name(alias_name);
+
+                if let Some(slot) = self.slots.resolve(&ident.name) {
+                    self.emit(Op::ExportLocal { slot, alias });
+                } else {
+                    let name = self.push_name(ident.name.clone());
+                    self.emit_at(Op::ExportNamed { name, alias }, ident.pos);
+                }
+                Lowered::Empty
+            }
+
+            #[cfg(not(feature = "no_module"))]
+            Stmt::Import(payload, pos) => {
+                self.caps.insert(Caps::IMPORT);
+
+                let (expr, alias) = &**payload;
+                self.expression(expr);
+                let alias = self.push_name(alias.name.clone());
+                self.emit_at(Op::Import { alias }, *pos);
+                Lowered::Empty
+            }
+
+            // Not lowered yet, and listed rather than matched with `_` on
+            // purpose. A wildcard here silently turned `import` and `eval`
+            // into fragments that answered differently from the walker; naming
+            // every kind means a new one added to Rhai's AST stops the build
+            // until someone has decided which of the three it is — lowered,
+            // fragment, or too scope-shaped to be either.
+            //
+            // The ones below are fragments because each either declares
+            // nothing or rewinds what it declares, so the scope is the same
+            // shape afterwards. That is the property to check before adding to
+            // this list.
+            other @ (Stmt::FnCall(..) | Stmt::Assignment(..) | Stmt::Return(..)) => {
+                let residual = self.push_residual(wrap_statements(vec![other.clone()]));
+                self.emit(Op::EvalAst {
+                    residual,
+                    rewind_scope: true,
+                });
+                Lowered::Value
+            }
+        }
+    }
+
+    /// Lower one expression, leaving its value on the stack.
+    fn expression(&mut self, expr: &Expr) {
+        match expr {
+            Expr::BoolConstant(value, ..) => self.emit(Op::Bool(*value)),
+            Expr::Unit(..) => self.emit(Op::Unit),
+
+            Expr::IntegerConstant(value, ..) => self.constant(Dynamic::from_int(*value)),
+            Expr::CharConstant(value, ..) => self.constant(Dynamic::from_char(*value)),
+            Expr::StringConstant(value, ..) => self.constant(Dynamic::from(value.clone())),
+            #[cfg(not(feature = "no_float"))]
+            Expr::FloatConstant(value, ..) => {
+                self.caps.insert(Caps::FLOAT);
+                self.constant(Dynamic::from_float(**value))
+            }
+
+            Expr::DynamicConstant(value, ..) if is_poolable(value) => {
+                self.constant((**value).clone());
+            }
+
+            Expr::Variable(payload, ..) => {
+                // A qualified name resolves against imported modules, not the
+                // scope, so it is not a slot.
+                let is_qualified = has_namespace!(payload);
+
+                match self.slots.resolve(&payload.1) {
+                    Some(slot) if !is_qualified => self.emit(Op::LoadLocal(slot)),
+                    // Not a local this compiler declared, so no slot can name
+                    // it: it is the caller's, a module's, or nothing. Looked
+                    // up by name at run time, at the cost of a scope scan.
+                    _ if !is_qualified => {
+                        let name = self.push_name(payload.1.clone());
+                        self.emit_at(Op::LoadNamed(name), expr.position());
+                    }
+                    #[cfg(not(feature = "no_module"))]
+                    _ => {
+                        let name = self.push_name(
+                            crate::grain::bytecode::names::qualify(&payload.2, &payload.1).into(),
+                        );
+                        self.emit_at(Op::LoadNamed(name), payload.2.position());
+                        self.caps.insert(Caps::MODULE);
+                    }
+                    #[cfg(feature = "no_module")]
+                    _ => unreachable!("qualified variable access cannot exist under `no_module`"),
+                }
+            }
+
+            Expr::And(operands, ..) => self.short_circuit(operands, false),
+            Expr::Or(operands, ..) => self.short_circuit(operands, true),
+            Expr::Coalesce(operands, ..) => self.coalesce(operands),
+
+            Expr::FnCall(call, pos) if self.fn_ptr_call(call, *pos) => {}
+
+            Expr::FnCall(call, pos) if self.is_lowerable_call(call) => {
+                self.lower_call(call, *pos);
+            }
+
+            // `eval` evaluates a script in the *caller's* scope, so what it
+            // declares outlives it and the next statement can name it. The
+            // slot model resolved its indices against a scope that does not
+            // have those entries, so a lowered read past an `eval` looks in
+            // the wrong place — `eval("let x = 40"); x + 2` found no `x` where
+            // the walker found 40. Refusing the lowering hands the body to the
+            // walker, which is the only thing that knows the real shape.
+            Expr::FnCall(call, ..) if call.name == crate::engine::KEYWORD_EVAL => {
+                self.residual_expr(expr);
+                self.defeated = true;
+            }
+
+            // A literal whose elements are all constant never reaches here —
+            // Rhai's optimizer folds it into a `DynamicConstant` first — so
+            // this is the one that has to be built at run time.
+            #[cfg(not(feature = "no_index"))]
+            Expr::Array(elements, ..) if elements.len() <= u16::MAX as usize => {
+                self.caps.insert(Caps::ARRAY);
+
+                for (index, element) in elements.iter().enumerate() {
+                    self.expression(element);
+                    // Positioned at the element, because that is what Rhai
+                    // blames when this element is the one that tips the
+                    // running total over the limit.
+                    self.emit_at(
+                        Op::CheckSize {
+                            index: index as u16,
+                            is_map: false,
+                        },
+                        element.position(),
+                    );
+                }
+                self.emit_at(Op::MakeArray(elements.len() as u16), expr.position());
+            }
+
+            // The other half of the same shape. Rhai keeps a map literal as a
+            // template holding every key — the constant values already in
+            // place, the computed ones as placeholders — plus the list of
+            // entries still to evaluate.
+            //
+            // An all-constant map is folded into a `DynamicConstant` and never
+            // arrives here; one with a single computed value does.
+            #[cfg(not(feature = "no_object"))]
+            Expr::Map(entries, ..) if entries.0.len() <= u16::MAX as usize => {
+                self.caps.insert(Caps::MAP);
+
+                let (computed, template) = &**entries;
+                let template = Dynamic::from_map(template.clone());
+                // A template whose constants the pool cannot hold is a program
+                // that could not be written to an artifact anyway.
+                if !is_poolable(&template) {
+                    self.residual_expr(expr);
+                    return;
+                }
+
+                self.constant(template);
+                for (index, (key, value)) in computed.iter().enumerate() {
+                    self.constant(key.name.clone().into());
+                    self.expression(value);
+                    self.emit_at(
+                        Op::CheckSize {
+                            index: index as u16,
+                            is_map: true,
+                        },
+                        value.position(),
+                    );
+                }
+                self.emit_at(Op::MakeMap(computed.len() as u16), expr.position());
+            }
+
+            // A block used for its value: `let y = if c { 1 } else { 2 }`,
+            // `let y = switch ..`, `let y = { let z = 1; z }`. Rhai evaluates
+            // it with `restore_orig_state` set, so it rewinds what it declared
+            // — which is what `block` emits.
+            Expr::Stmt(block) => {
+                if !self.block_value(block.statements()) {
+                    self.defeated = true;
+                }
+            }
+
+            // The optimizer folds an all-constant interpolation away before
+            // this sees it, so what arrives has at least two segments.
+            Expr::InterpolatedString(segments, ..) => {
+                self.emit(Op::InterpolateStart);
+                for segment in segments.iter() {
+                    self.expression(segment);
+                    // The append carries the segment's own position, because
+                    // that is what Rhai blames when the size limit goes over.
+                    self.emit_at(Op::InterpolateAppend, segment.position());
+                }
+                self.emit(Op::InterpolateEnd);
+            }
+
+            Expr::Dot(..) | Expr::Index(..) => {
+                // A chain emits its own operands, so a failed attempt has to
+                // leave nothing behind.
+                let mark = self.mark();
+                if !self.chain(expr, Tail::Read, None) {
+                    self.rewind(mark);
+                    self.residual_expr(expr);
+                }
+            }
+
+            // Custom syntax runs host code against an `EvalContext`, which can
+            // declare into the caller's scope. What it declares is invisible
+            // here, so the slot model would be resolved against a scope shape
+            // that is not the one at runtime. Refusing the lowering keeps the
+            // walker's answer, as it does for `eval` above.
+            #[cfg(not(feature = "no_custom_syntax"))]
+            Expr::Custom(custom, pos) => {
+                if custom.scope_may_be_changed || !self.custom_syntax(custom, *pos) {
+                    self.residual_expr(expr);
+                    self.defeated = true;
+                }
+            }
+
+            // Listed rather than matched with `_`, for the reason
+            // [`Lowering::statement`] gives: a wildcard is what let `eval`
+            // become a fragment that answered differently from the walker.
+            //
+            // These are fragments because none of them can change the shape of
+            // the scope the slot model resolved its indices against. The
+            // guarded arms above fall through to here when their guard fails —
+            // a pool-defeating constant, a literal too long for its operand, a
+            // call Rhai resolves syntactically.
+            // The frame's receiver, flattened as every consumer but three
+            // wants it — see [`Op::LoadThis`] and `unflattened` below. Its own
+            // position, because that is what `ErrorUnboundThis` carries.
+            Expr::ThisPtr(pos) => {
+                self.caps.insert(Caps::THIS);
+                self.emit_at(Op::LoadThis, *pos)
+            }
+
+            Expr::MethodCall(..)
+            | Expr::Property(..)
+            | Expr::DynamicConstant(..)
+            | Expr::FnCall(..)
+            | Expr::Array(..)
+            | Expr::Map(..) => self.residual_expr(expr),
+        }
+    }
+
+    /// Where Rhai's method-call rewrite would take this call's first argument
+    /// from, if it applies at all.
+    fn receiver(&mut self, call: &FnCallExpr) -> Option<Receiver> {
+        // An operator short-circuits before the rewrite is reached, and a call
+        // that captures the enclosing scope is excluded from it outright.
+        if call.op_token.is_some() || call.capture_parent_scope {
+            return None;
+        }
+
+        // `f(this, ..)` takes the same rewrite as a variable. Rhai also requires
+        // the receiver not to be shared and nothing to be curried, and neither
+        // is a question the compiler can answer: sharing is a run-time property,
+        // deferred to the VM as it already is for a read-only local, and a
+        // curried redirect can never reach this instruction because
+        // `call`/`curry` go through `Op::CallFnPtr` and `is_lowerable_call`
+        // refuses them here.
+        if let Some(Expr::ThisPtr(..)) = call.args.first() {
+            self.caps.insert(Caps::THIS);
+            return Some(Receiver::This);
+        }
+
+        let Some(Expr::Variable(payload, ..)) = call.args.first() else {
+            return None;
+        };
+        let qualified = has_namespace!(payload);
+
+        match self.slots.resolve(&payload.1) {
+            Some(slot) if !qualified => Some(Receiver::Local(slot)),
+            _ if self.is_variable_name(qualified) => {
+                Some(Receiver::Named(self.push_name(payload.1.clone())))
+            }
+            _ => None,
+        }
+    }
+
+    /// Push the arguments left to right, then dispatch.
+    fn lower_call(&mut self, call: &FnCallExpr, pos: Position) {
+        let capture_parent_scope = call.capture_parent_scope;
+        let argc = u8::try_from(call.args.len()).expect("checked by is_lowerable_call");
+
+        // Namespace-qualified?
+        #[cfg(not(feature = "no_module"))]
+        if !call.namespace.is_empty() {
+            self.caps.insert(Caps::MODULE);
+            let mut name = crate::grain::bytecode::names::qualify(&call.namespace, &call.name);
+            if capture_parent_scope {
+                name.push('!');
+            }
+            let name = self.push_name(name.into());
+
+            // `ns::f(x, ..)` -> `ns::f(&mut x, ..)`
+            if let Some(receiver) = self.receiver(call) {
+                match receiver {
+                    Receiver::This => self.emit_at(Op::LoadThis, call.args[0].position()),
+                    Receiver::Named(var) => {
+                        self.emit_at(Op::LoadNamed(var), call.args[0].position())
+                    }
+                    _ => (),
+                }
+                for arg in call.args.iter().skip(1) {
+                    self.expression(arg);
+                }
+
+                self.emit_at(
+                    Op::CallRef {
+                        name,
+                        argc,
+                        receiver,
+                        capture_parent_scope,
+                    },
+                    pos,
+                );
+            } else {
+                for arg in call.args.iter() {
+                    self.expression(arg);
+                }
+                self.emit_at(
+                    Op::Call {
+                        name,
+                        argc,
+                        op: None,
+                        capture_parent_scope,
+                    },
+                    pos,
+                );
+            }
+            return;
+        }
+
+        // `f(x, ..)` is `x.f(..)`, so the variable is read after the other
+        // arguments and by reference. See [`Op::CallRef`].
+        if let Some(receiver) = self.receiver(call) {
+            // `this` goes on *first*, unlike either of the others. Rhai's two
+            // arms disagree about when it is read: the by-reference one takes a
+            // pointer after the arguments, but the fallback a shared or unbound
+            // receiver lands in reads and flattens it before them.
+            //
+            // Reading first is what makes an unbound `f(this, no_such)` report
+            // `ErrorUnboundThis`, and what stops an argument that writes to
+            // `this` being seen by the value passed.
+            if let Receiver::This = receiver {
+                self.emit_at(Op::LoadThis, call.args[0].position());
+            }
+            for arg in call.args.iter().skip(1) {
+                self.expression(arg);
+            }
+            // A name is resolved here, where its own position is the one an
+            // `ErrorVariableNotFound` wants, and then moved under the arguments
+            // it was read after.
+            if let Receiver::Named(var) = receiver {
+                self.emit_at(Op::LoadNamed(var), call.args[0].position());
+                if argc > 1 {
+                    self.emit(Op::Rotate(argc - 1));
+                }
+            }
+
+            let name = if capture_parent_scope {
+                self.push_name(format!("{}!", call.name).into())
+            } else {
+                self.push_name(call.name.clone())
+            };
+            self.emit_at(
+                Op::CallRef {
+                    name,
+                    argc,
+                    receiver,
+                    capture_parent_scope,
+                },
+                pos,
+            );
+            return;
+        }
+
+        for arg in call.args.iter() {
+            self.expression(arg);
+        }
+        let op = (argc == 1 || argc == 2)
+            .then(|| call.op_token.clone())
+            .flatten()
+            .map(|token| self.push_token(token));
+        let capture_parent_scope = capture_parent_scope && op.is_none();
+        let name = if capture_parent_scope {
+            self.push_name(format!("{}!", call.name).into())
+        } else {
+            self.push_name(call.name.clone())
+        };
+        self.emit_at(
+            Op::Call {
+                name,
+                argc,
+                op,
+                capture_parent_scope,
+            },
+            pos,
+        );
+    }
+
+    /// Whether a name read is a variable read at all.
+    ///
+    /// Currently everything other than a namespace-qualified name
+    /// is considered a valid variable name.
+    ///
+    /// Keeping this a separate function for future expansion purposes.
+    #[inline(always)]
+    const fn is_variable_name(&self, qualified: bool) -> bool {
+        !qualified
+    }
+
+    /// Pool what `x op= y` needs, if there is an operator at all.
+    fn op_assignment(&mut self, op_info: &OpAssignment) -> Option<u32> {
+        op_info
+            .get_op_assignment_info()
+            .map(|(_, _, op_assign, op_assign_str, op, op_str)| {
+                let entry = AssignOp {
+                    op_assign: op_assign.clone(),
+                    op_assign_name: self.push_name(op_assign_str.into()),
+                    op: op.clone(),
+                    op_name: self.push_name(op_str.into()),
+                };
+                self.push_assign_op(entry)
+            })
+    }
+
+    /// Read a variable without flattening it, leaving a shared cell shared.
+    ///
+    /// Rhai's own variable read works this way — `Target::take_or_clone` hands
+    /// back the shared value untouched — and the places that want the contents
+    /// flatten for themselves.
+    ///
+    /// [`Op::LoadLocal`] flattens instead, which is right where the value is
+    /// what matters and wrong in the two places the cell is:
+    /// * a closure's captured variable, where the aliasing *is* the capture;
+    /// * a `switch` subject, which Rhai refuses to match on when it is not
+    ///   hashable, and a shared value is not — so a shared subject falls to the
+    ///   default arm however well it would otherwise have matched.
+    fn unflattened(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Variable(payload, ..) if !has_namespace!(payload) => {
+                match self.slots.resolve(&payload.1) {
+                    Some(slot) => self.emit(Op::LoadShared(slot)),
+                    // The caller's. A closure can capture one of those too, and
+                    // reading it flat would bind a copy.
+                    None if self.is_variable_name(false) => {
+                        let name = self.push_name(payload.1.clone());
+                        self.emit_at(Op::LoadSharedNamed(name), expr.position());
+                    }
+                    None => self.expression(expr),
+                }
+            }
+            // The receiver can be a shared cell too — a closure capturing the
+            // variable a method was called on — and the three readers that come
+            // through here have to see the cell rather than what it holds.
+            Expr::ThisPtr(pos) => {
+                self.caps.insert(Caps::THIS);
+                self.emit_at(Op::LoadThisShared, *pos)
+            }
+            other => self.expression(other),
+        }
+    }
+
+    /// Lower `Fn(name)`, `curry(f, ..)` or `call(f, ..)`, if this is one.
+    ///
+    /// Rhai resolves these three by name before dispatch, but only at the
+    /// arities it recognizes; anything else is an ordinary call that will
+    /// not find a function.
+    ///
+    /// Matching those arities exactly is what keeps the two agreeing on
+    /// the failures as well as the successes.
+    fn fn_ptr_call(&mut self, call: &FnCallExpr, pos: Position) -> bool {
+        #[cfg(not(feature = "no_module"))]
+        if !call.namespace.is_empty() {
+            return false;
+        }
+        let argc = call.args.len();
+
+        match (call.name.as_str(), argc) {
+            // The argument has to arrive as the cell, not its contents, or the
+            // answer is always false.
+            //
+            // Not lowered under `no_closure`: Rhai registers no `is_shared`
+            // there, so the call has to reach the walker and fail the way Rhai
+            // fails it. Lowering it would answer a question Rhai refuses.
+            #[cfg(not(feature = "no_closure"))]
+            (crate::engine::KEYWORD_IS_SHARED, 1) => {
+                self.caps.insert(Caps::SHARING);
+                self.unflattened(&call.args[0]);
+                self.emit_at(Op::IsShared, pos);
+            }
+            // All of these are reported against the *argument* rather than
+            // against the call: Rhai reads it, and everything it can then
+            // complain about — a name that is not a string, a string that is
+            // not an identifier, a first argument that is not a pointer — is
+            // filled in with the argument's position.
+            (crate::engine::KEYWORD_FN_PTR, 1) => {
+                self.expression(&call.args[0]);
+                self.emit_at(Op::MakeFnPtr, call.args[0].position());
+                self.caps.insert(Caps::FN_PTR);
+            }
+            (crate::engine::KEYWORD_FN_PTR_CURRY, _) if argc > 1 => {
+                let mut args = call.args.iter();
+                self.expression(args.next().expect("checked by the arity"));
+                for arg in args {
+                    // The captured variables. These must bind the *cell* — a
+                    // flattening read would hand the closure a copy and it
+                    // would stop being one.
+                    self.unflattened(arg);
+                }
+                self.emit_at(Op::Curry((argc - 1) as u8), call.args[0].position());
+                self.caps.insert(Caps::FN_PTR | Caps::CURRYING);
+            }
+            (crate::engine::KEYWORD_FN_PTR_CALL, _)
+                if argc >= 1 && argc <= u8::MAX as usize + 1 =>
+            {
+                for arg in call.args.iter() {
+                    self.expression(arg);
+                }
+                self.emit_at(
+                    Op::CallFnPtr {
+                        argc: (argc - 1) as u8,
+                        is_method: false,
+                        capture_parent_scope: call.capture_parent_scope,
+                        // Call position binds no receiver at all.
+                        receiver: None,
+                    },
+                    pos,
+                );
+                self.caps.insert(Caps::FN_PTR);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether a call can go through generic dispatch.
+    ///
+    /// Rhai resolves a handful of names syntactically before dispatch ever happens,
+    /// so routing those through `call_fn_raw` would change what they mean.
+    /// A call that captures the enclosing scope is closure construction,
+    /// and a qualified name resolves against imported modules;
+    /// neither is a plain call.
+    fn is_lowerable_call(&self, call: &FnCallExpr) -> bool {
+        // These are handled by `is_syntactic_call` above, but only at the
+        // arities Rhai treats syntactically — at any other arity it falls
+        // through to ordinary dispatch, and so must catch them here.
+        const SYNTACTIC: &[&str] = &[
+            crate::engine::KEYWORD_EVAL,
+            crate::engine::KEYWORD_FN_PTR,
+            crate::engine::KEYWORD_FN_PTR_CALL,
+            crate::engine::KEYWORD_FN_PTR_CURRY,
+            #[cfg(not(feature = "no_closure"))]
+            crate::engine::KEYWORD_IS_SHARED,
+        ];
+
+        call.args.len() <= u8::MAX as usize && !SYNTACTIC.contains(&call.name.as_str())
+    }
+
+    /// Lower `&&` or `||`: evaluate operands left to right, stopping at the
+    /// first that decides the result.
+    ///
+    /// Each operand is coerced to bool at its own position, which is why the
+    /// jumps carry one — Rhai reports a non-boolean operand against the
+    /// operand, not the expression.
+    fn short_circuit(&mut self, operands: &[Expr], stop_on: bool) {
+        let mut decided = Vec::new();
+
+        for operand in operands {
+            self.expression(operand);
+            let pos = operand.position();
+            let site = self.code.len();
+            self.emit_at(
+                if stop_on {
+                    Op::JumpIfTrue { target: u32::MAX }
+                } else {
+                    Op::JumpIfFalse { target: u32::MAX }
+                },
+                pos,
+            );
+            decided.push(site);
+        }
+
+        self.emit(Op::Bool(!stop_on));
+        let past = self.emit_jump();
+        for site in decided {
+            self.patch_here(site);
+        }
+        self.emit(Op::Bool(stop_on));
+        self.patch_here(past);
+    }
+
+    /// Lower `??`: evaluate operands left to right, stopping at the
+    /// first that is not unit.
+    fn coalesce(&mut self, operands: &[Expr]) {
+        let mut decided = Vec::new();
+        let last = operands.len();
+
+        for operand in operands {
+            self.expression(operand);
+
+            // Leave the last operand to fall through, so it is the one that decides
+            // if all the other operands are `()`
+            if decided.len() < last - 1 {
+                let pos = operand.position();
+                let site = self.code.len();
+                self.emit_at(Op::SkipIfNotUnit { target: u32::MAX }, pos);
+                self.emit_at(Op::Pop, pos);
+                decided.push(site);
+            }
+        }
+        for site in decided {
+            self.patch_here(site);
+        }
+    }
+
+    /// Lower a block, leaving its value — the last statement's — on the stack,
+    /// and dropping anything it declared.
+    ///
+    /// `Empty` when that value is unit and no instruction pushed it: an empty
+    /// block, or one ending in a declaration or an assignment. Whoever reads the
+    /// block's value materializes the unit; whoever discards it does neither.
+    fn block(&mut self, statements: &[Stmt]) -> Lowered {
+        let depth = self.slots.depth();
+        let saved_level = self.level;
+        self.level += 1;
+
+        let Some((last, leading)) = statements.split_last() else {
+            self.level = saved_level;
+            return Lowered::Empty;
+        };
+
+        for stmt in leading {
+            match self.statement(stmt) {
+                Lowered::Defeated => {
+                    self.level = saved_level;
+                    return Lowered::Defeated;
+                }
+                Lowered::Value => self.emit(Op::Pop),
+                Lowered::Empty => {}
+            }
+        }
+        let lowered = match self.statement(last) {
+            Lowered::Defeated => {
+                self.level = saved_level;
+                return Lowered::Defeated;
+            }
+            lowered => lowered,
+        };
+
+        self.unwind_to(depth);
+        self.level = saved_level;
+        lowered
+    }
+
+    /// Lower a block whose value is read, materializing the unit an `Empty` one
+    /// stands for. Returns false if the slot model gave up.
+    fn block_value(&mut self, statements: &[Stmt]) -> bool {
+        match self.block(statements) {
+            Lowered::Defeated => false,
+            Lowered::Empty => {
+                self.emit(Op::Unit);
+                true
+            }
+            Lowered::Value => true,
+        }
+    }
+
+    /// Lower a block for its effects only, leaving nothing on the stack.
+    ///
+    /// Loop bodies discard their value: Rhai's loops yield unit or whatever a
+    /// `break` supplied, never the body's last statement.
+    fn block_discarding(&mut self, statements: &[Stmt]) -> bool {
+        match self.block(statements) {
+            Lowered::Defeated => false,
+            Lowered::Value => {
+                self.emit(Op::Pop);
+                true
+            }
+            Lowered::Empty => true,
+        }
+    }
+
+    /// Emit the scope truncation for leaving a block, and unwind the
+    /// compile-time slot model with it.
+    ///
+    /// The value the block produced is already on the operand stack, so it
+    /// survives locals being dropped.
+    fn unwind_to(&mut self, depth: usize) {
+        if self.slots.depth() > depth {
+            let depth = u16::try_from(depth).expect("slot count is bounded");
+            self.emit(Op::UnwindTo(depth));
+            self.slots.unwind_to(depth as usize);
+        }
+    }
+
+    /// Where the instruction list currently ends, for [`Lowering::rewind`].
+    fn mark(&self) -> usize {
+        self.code.len()
+    }
+
+    /// Drop everything emitted since `mark`.
+    ///
+    /// Only safe for a region no surviving jump points into or out of. A chain
+    /// qualifies because it emits its operands and then one instruction, and
+    /// gives up before emitting that instruction; so does the single jump
+    /// [`Lowering::drop_idle_jump`] takes back, which goes with its site.
+    fn rewind(&mut self, mark: usize) {
+        self.code.truncate(mark);
+        self.positions.truncate(mark);
+    }
+
+    /// Take back a jump that would land on the instruction after itself.
+    ///
+    /// Call it where the next instruction emitted *is* what `sites` is waiting
+    /// for: the last of them can then fall through to that instruction instead
+    /// of jumping to it, so it is dropped along with its place in the list
+    /// rather than patched.
+    ///
+    /// Only the last entry is a candidate, because only it can still be the
+    /// instruction most recently emitted — and nothing can point at it yet.
+    /// These lists are patched once every body has an address, and what a switch
+    /// table holds are guards and bodies, never the jumps out of them.
+    fn drop_idle_jump(&mut self, sites: &mut Vec<usize>) {
+        if let Some(&site) = sites.last() {
+            if site + 1 == self.code.len() {
+                sites.pop();
+                self.rewind(site);
+            }
+        }
+    }
+
+    fn here(&self) -> u32 {
+        u32::try_from(self.code.len()).expect("chunk length is bounded")
+    }
+
+    /// Emit a jump with a placeholder target, returning its site for patching.
+    fn emit_jump(&mut self) -> usize {
+        let site = self.code.len();
+        self.emit(Op::Jump(u32::MAX));
+        site
+    }
+
+    fn emit_jump_if_false(&mut self, pos: Position) -> usize {
+        let site = self.code.len();
+        self.emit_at(Op::JumpIfFalse { target: u32::MAX }, pos);
+        site
+    }
+
+    /// Point a previously emitted jump at the next instruction.
+    fn patch_here(&mut self, site: usize) {
+        let target = self.here();
+        self.patch_to(site, target);
+    }
+
+    /// The same, for a jump that was only worth emitting under a condition.
+    fn patch_here_if(&mut self, site: Option<usize>) {
+        if let Some(site) = site {
+            self.patch_here(site);
+        }
+    }
+
+    /// Point a previously emitted jump at an instruction already emitted.
+    fn patch_to(&mut self, site: usize, target: u32) {
+        match &mut self.code[site] {
+            Op::Jump(slot)
+            | Op::JumpIfFalse { target: slot, .. }
+            | Op::JumpIfTrue { target: slot, .. }
+            | Op::SkipIfNotUnit { target: slot, .. }
+            | Op::IterNext { exit: slot, .. }
+            | Op::PushHandler { target: slot, .. } => *slot = target,
+            other => unreachable!("patched a {other:?}, which is not a jump"),
+        }
+    }
+
+    /// Emit an `IterDrop` for every iterator live above `floor`.
+    fn drop_iterators(&mut self, floor: usize) {
+        for _ in floor..self.iters {
+            self.emit(Op::IterDrop);
+        }
+    }
+
+    /// Disarm every `try` region entered above `floor`.
+    ///
+    /// A `break` or `continue` jumps over the `PopHandler` the straight-line
+    /// path would have run. Left armed, the handler keeps a stale target and a
+    /// stale set of depths, and the next error anywhere in the frame is caught
+    /// into a `catch` block that has already been left.
+    fn pop_handlers(&mut self, floor: usize) {
+        for _ in floor..self.handlers {
+            self.emit(Op::PopHandler);
+        }
+    }
+
+    /// Open a loop whose `break` and `continue` unwind to the same place —
+    /// `while`, `loop` and `do`, which declare nothing of their own.
+    fn begin_loop(&mut self, continue_target: u32, has_break_value: bool) {
+        let depth = u16::try_from(self.slots.depth()).expect("slot count is bounded");
+        self.loops.push(Loop {
+            continue_target,
+            break_depth: depth,
+            continue_depth: depth,
+            iters: self.iters,
+            handlers: self.handlers,
+            stack_surplus: self.stack_surplus,
+            owns_iterator: false,
+            breaks: Vec::new(),
+            has_break_value,
+        });
+    }
+
+    /// Open a `for`, which does declare: the loop variable and any counter
+    /// live between the two depths, so leaving drops them and going round
+    /// again does not.
+    fn begin_for(&mut self, continue_target: u32, break_depth: u16, has_break_value: bool) {
+        self.loops.push(Loop {
+            continue_target,
+            break_depth,
+            continue_depth: u16::try_from(self.slots.depth()).expect("slot count is bounded"),
+            iters: self.iters,
+            handlers: self.handlers,
+            stack_surplus: self.stack_surplus,
+            owns_iterator: true,
+            breaks: Vec::new(),
+            has_break_value,
+        });
+    }
+
+    fn end_loop(&mut self) -> Vec<usize> {
+        self.loops.pop().expect("loop stack is balanced").breaks
+    }
+
+    /// Push the value a loop has when it runs to completion — unit
+    /// — and land every `break` in it just past that, when a `break`
+    /// value expression is present.
+    ///
+    /// Otherwise, leave nothing on the stack and return [`Lowered::Empty`].
+    fn exit_loop(&mut self, breaks: Vec<usize>, has_break_value: bool) -> Lowered {
+        if has_break_value {
+            self.emit(Op::Unit);
+        }
+        // A valued `break` has already pushed the loop's result, so it must
+        // bypass the unit supplied when the loop ends normally.
+        for site in breaks {
+            self.patch_here(site);
+        }
+        if has_break_value {
+            Lowered::Value
+        } else {
+            Lowered::Empty
+        }
+    }
+
+    fn residual_expr(&mut self, expr: &Expr) {
+        let residual = self.push_residual(expr.clone());
+        self.emit(Op::EvalAst {
+            residual,
+            rewind_scope: true,
+        });
+    }
+
+    fn constant(&mut self, value: Dynamic) {
+        let index = self.push_const(value);
+        self.emit(Op::Const(index));
+    }
+
+    fn push_const(&mut self, value: Dynamic) -> u32 {
+        if let Some(required_caps) = constant_caps(&value) {
+            self.caps.insert(required_caps);
+        }
+        // Programs at this scale make a linear scan cheaper than a hash map,
+        // and it keeps the pool in emission order for readable disassembly.
+        let rendered = format!("{value:?}");
+        // Use a buffer to avoid allocating a new string for every comparison.
+        let mut buf = String::new();
+        if let Some(index) = self.consts.iter().position(|existing| {
+            use std::fmt::Write;
+
+            buf.clear();
+            write!(&mut buf, "{existing:?}").expect("writing to a string cannot fail");
+            buf == rendered
+        }) {
+            return index as u32;
+        }
+        self.consts.push(value);
+        (self.consts.len() - 1) as u32
+    }
+
+    fn push_name(&mut self, name: ImmutableString) -> u32 {
+        if let Some(index) = self.names.iter().position(|existing| *existing == name) {
+            return index as u32;
+        }
+        self.names.push(name);
+        (self.names.len() - 1) as u32
+    }
+
+    /// A script uses a handful of distinct operators however many times it
+    /// mentions them, so the pool stays tiny and a linear scan is right.
+    fn push_token(&mut self, token: Token) -> u32 {
+        if let Some(index) = self.tokens.iter().position(|existing| *existing == token) {
+            return index as u32;
+        }
+        self.tokens.push(token);
+        (self.tokens.len() - 1) as u32
+    }
+
+    fn push_assign_op(&mut self, entry: AssignOp) -> u32 {
+        if let Some(index) = self
+            .assign_ops
+            .iter()
+            .position(|existing| *existing == entry)
+        {
+            return index as u32;
+        }
+        self.assign_ops.push(entry);
+        (self.assign_ops.len() - 1) as u32
+    }
+
+    fn push_residual(&mut self, expr: Expr) -> u32 {
+        self.residuals.push(expr);
+        (self.residuals.len() - 1) as u32
+    }
+
+    #[cfg(not(feature = "no_custom_syntax"))]
+    fn custom_syntax(&mut self, custom: &crate::ast::CustomExpr, pos: Position) -> bool {
+        let Some(key) = custom.tokens.first().cloned() else {
+            return false;
+        };
+
+        // A `$block$` input is lowered as its own chunk, called and returned
+        // from independently of the code around the custom syntax expression.
+        //
+        // `return` always unwinds past this chunk (and whatever loop and function
+        // it runs in), so it never has a valid target here.
+        //
+        // `break`/`continue` are only a problem when nothing inside the input
+        // catches them: one nested inside a `for`/`while`/`do` loop that catches
+        // it lowers fine.
+        if custom.inputs.iter().any(contains_escaping_jump) {
+            return false;
+        }
+
+        let jump = self.emit_jump();
+        let mut inputs = Vec::with_capacity(custom.inputs.len());
+
+        for input in &custom.inputs {
+            let saved_loops = std::mem::take(&mut self.loops);
+            let first = self.code.len();
+            self.emit(Op::Checkpoint);
+            self.expression(input);
+            self.loops = saved_loops;
+
+            if self.defeated {
+                return false;
+            }
+            self.emit(Op::Return);
+
+            let chunk = Chunk::new(first as u32, self.code.len() as u32, self.max_stack);
+            let literal = self
+                .custom_syntax_literal(input)
+                .map(|value| self.push_const(value));
+            inputs.push((chunk, literal));
+        }
+
+        self.patch_here(jump);
+        let site = self.custom_syntax.len();
+        let key = self.push_name(key);
+        let state = self.push_const(custom.state.clone());
+        self.custom_syntax
+            .push(CustomSyntaxSite { key, state, inputs });
+        self.emit_at(Op::CustomSyntax(site as u32), pos);
+        self.caps.insert(Caps::CUSTOM_SYNTAX);
+        true
+    }
+
+    /// The literal to hand back for a custom-syntax input, matching
+    /// [`Expression::get_string_value`][crate::api::custom_syntax::Expression::get_string_value]
+    /// and [`Expression::get_literal_value`][crate::api::custom_syntax::Expression::get_literal_value].
+    #[cfg(not(feature = "no_custom_syntax"))]
+    fn custom_syntax_literal(&self, expr: &Expr) -> Option<Dynamic> {
+        match expr {
+            Expr::DynamicConstant(value, ..) => Some(*value.clone()),
+            Expr::IntegerConstant(value, ..) => Some((*value).into()),
+            #[cfg(not(feature = "no_float"))]
+            Expr::FloatConstant(value, ..) => Some((*value).into()),
+            Expr::CharConstant(value, ..) => Some((*value).into()),
+            Expr::StringConstant(value, ..) => Some(value.clone().into()),
+            Expr::BoolConstant(value, ..) => Some((*value).into()),
+            Expr::Unit(..) => Some(Dynamic::UNIT),
+            // A namespaced variable (`m::x`) is not a simple name to the walker's
+            // `get_string_value`, which returns `None` for it -- unlike an
+            // unqualified variable, whose name it hands back.
+            Expr::Variable(value, ..) if has_namespace!(value) => None,
+            Expr::Variable(value, ..) => Some(value.1.clone().into()),
+            #[cfg(not(feature = "no_function"))]
+            Expr::ThisPtr(..) => Some(crate::engine::KEYWORD_THIS.into()),
+            _ => None,
+        }
+    }
+
+    fn emit(&mut self, op: Op) {
+        // An upper bound, not the answer: no instruction pushes more than one
+        // value, so one slot per instruction cannot be too small. The verifier
+        // replaces it with the measured high water once lowering is done.
+        self.max_stack = self.max_stack.saturating_add(1);
+        self.code.push(op);
+        self.positions.push(Position::NONE);
+    }
+
+    /// Emit an instruction that can fail against a place in the source.
+    ///
+    /// The position goes to the side table rather than into the instruction, so
+    /// it can be stripped from an artifact without touching the code.
+    fn emit_at(&mut self, op: Op, pos: Position) {
+        self.emit(op);
+        *self.positions.last_mut().expect("just emitted") = pos;
+    }
+}
+
+/// One step, still as AST.
+/// A step, and where Rhai would blame it.
+///
+/// The position travels with the step rather than being taken from the chain:
+/// Rhai reports each kind against its own node, and one chain instruction has
+/// only one position-table entry between all of them.
+enum ChainStep<'a> {
+    /// The index expression, and the `[` it sits behind — see [`Step::Index`].
+    Index(&'a Expr, crate::Position, crate::grain::bytecode::StepFlags),
+    Property(
+        &'a (
+            (ImmutableString, u64),
+            (ImmutableString, u64),
+            ImmutableString,
+        ),
+        crate::Position,
+        crate::grain::bytecode::StepFlags,
+    ),
+    Method(
+        &'a FnCallExpr,
+        crate::Position,
+        crate::grain::bytecode::StepFlags,
+    ),
+}
+
+/// Unpick Rhai's nested chain encoding into a root and a list of steps.
+///
+/// `a.b[i]` is `Dot { lhs: a, rhs: Index { lhs: b, rhs: i } }`: each nested
+/// node's `lhs` is the current step's operand and its `rhs` is the
+/// continuation, so the list is built by walking `rhs` and taking `lhs` at each
+/// level. The innermost `rhs` is the last step rather than a continuation,
+/// which is what ends the walk.
+///
+/// [`ASTFlags::BREAK`] is what ends it, and it carries real information:
+/// `a[b[0]]` and `a[b][0]` have the same shape, and the flag is the only thing
+/// that says the first one's `b[0]` is an index expression rather than two
+/// steps.
+///
+/// Returns `None` for a dot onto anything but a property or a method.
+fn flatten_chain<'a>(
+    lowering: &mut Lowering,
+    expr: &'a Expr,
+) -> Option<(&'a Expr, Vec<ChainStep<'a>>)> {
+    /// A chain node's parts: operand side, continuation side, and whether the
+    /// step it introduces is a property rather than an index.
+    fn parts<'a>(
+        lowering: &mut Lowering,
+        expr: &'a Expr,
+    ) -> Option<(&'a Expr, &'a Expr, ASTFlags, bool)> {
+        match expr {
+            Expr::Dot(binary, flags, ..) => {
+                lowering.caps.insert(Caps::METHOD);
+                Some((&binary.lhs, &binary.rhs, *flags, true))
+            }
+            Expr::Index(binary, flags, ..) => {
+                lowering.caps.insert(Caps::INDEXING);
+                Some((&binary.lhs, &binary.rhs, *flags, false))
+            }
+            _ => None,
+        }
+    }
+
+    let (root, mut rest, mut flags, mut dotted) = parts(lowering, expr)?;
+    let mut steps = Vec::new();
+    // Rhai's `op_pos`, which is the position of the chain node the step is
+    // being taken *inside* rather than of the step's operand, and which walks
+    // down with the recursion.
+    let mut bracket_pos = expr.position();
+
+    loop {
+        let mut step_flags = StepFlags::default();
+
+        if flags.contains(ASTFlags::NEGATED) {
+            step_flags.insert(StepFlags::SKIP_IF_UNIT);
+        }
+
+        // `rest` is the continuation only when it is a chain node *and* this
+        // node is not marked as the last one. Otherwise it is this step's own
+        // operand — the index expression, or the property being read.
+        let next = (!flags.contains(ASTFlags::BREAK))
+            .then(|| parts(lowering, rest))
+            .flatten();
+
+        let (operand, following) = match next {
+            Some((operand, _, _, _)) => (operand, Some(rest)),
+            None => (rest, None),
+        };
+
+        steps.push(match (dotted, operand) {
+            (true, Expr::Property(prop, pos)) => {
+                lowering.caps.insert(Caps::PROPERTY);
+                ChainStep::Property(prop, *pos, step_flags)
+            }
+            (true, Expr::MethodCall(call, pos)) => {
+                lowering.caps.insert(Caps::METHOD);
+                ChainStep::Method(call, *pos, step_flags)
+            }
+            // `a.(expr)` is not syntax, so a dot onto anything else is a shape
+            // the parser only makes for something handled elsewhere.
+            (true, _) => return None,
+            (false, index) => {
+                lowering.caps.insert(Caps::INDEXING);
+                ChainStep::Index(index, bracket_pos, step_flags)
+            }
+        });
+
+        match following {
+            Some(node) => {
+                let (_, next_rest, next_flags, next_dotted) =
+                    parts(lowering, node).expect("checked by `next`");
+                rest = next_rest;
+                flags = next_flags;
+                dotted = next_dotted;
+                bracket_pos = node.position();
+            }
+            None => break,
+        }
+    }
+
+    Some((root, steps))
+}
+
+/// Wrap statements as a block expression.
+///
+/// `Expr::Stmt` is the one shape `eval_expression_tree_raw` routes to
+/// `eval_stmt_block` rather than `eval_expr`, which is what lets statements go
+/// back through the walker at all.
+fn wrap_statements(statements: Vec<Stmt>) -> Expr {
+    let span = statements.first().zip(statements.last()).map_or_else(
+        || Span::new(Position::NONE, Position::NONE),
+        // `crate::types`, not `crate::types::position`: `no_position` swaps the
+        // module out for a zero-sized one and re-exports `Span` from whichever
+        // is in play.
+        |(first, last)| crate::types::Span::new(first.position(), last.position()),
+    );
+
+    Expr::Stmt(Box::new(StmtBlock::new_with_span(statements, span)))
+}
+
+/// What orders one script function against another when lowering.
+///
+/// Everything that tells two declarations apart, nothing that varies between
+/// runs. Rhai refuses a duplicate name, arity and receiver, so this is total.
+#[cfg(not(feature = "no_function"))]
+fn declaration_order(def: &ScriptFuncDef) -> (&str, usize, Option<&str>) {
+    #[cfg(not(feature = "no_object"))]
+    let this_type = def.this_type.as_deref();
+    #[cfg(feature = "no_object")]
+    let this_type = None;
+
+    (&def.name, def.params.len(), this_type)
+}
+
+/// Check whether a statement block or statement contains a `break` with an
+/// expression value targeting this loop level (stopping at nested loops).
+fn has_break_value(stmt: &Stmt) -> bool {
+    let mut has_value = false;
+    let mut path = Vec::new();
+
+    stmt.walk(&mut path, &mut |path| match path.last() {
+        Some(ASTNode::Stmt(Stmt::BreakLoop(Some(..), flags, ..)))
+            if flags.contains(ASTFlags::BREAK) =>
+        {
+            has_value = true;
+            false
+        }
+        Some(ASTNode::Stmt(Stmt::For(..) | Stmt::While(..) | Stmt::Do(..))) => false,
+        _ => true,
+    });
+
+    has_value
+}
+
+/// Check whether a custom-syntax `$block$` / `$expr$` input contains a
+/// `return`, `break` or `continue` that would jump outside the chunk the
+/// input lowers to.
+///
+/// A `return` always escapes: it unwinds past the input's own chunk, and
+/// past whatever loop or function frame runs it, regardless of nesting. A
+/// `break`/`continue` (`Stmt::BreakLoop`) only escapes when nothing inside
+/// the input catches it -- once inside a `for`/`while`/`do` that is itself
+/// part of the input, every `break`/`continue` under it (at any depth)
+/// targets that loop's own exit, a target inside the same chunk, so it is
+/// never a problem for anything nested inside such a loop.
+///
+/// Unlike [`has_break_value`], which only needs *a* match and so is free to
+/// abort the whole walk as soon as it stops at a nested loop, this has to be
+/// exhaustive: an unmasked `break`/`return` can sit anywhere in the tree,
+/// including past a sibling loop `walk` would otherwise never reach if the
+/// callback aborted early. So the callback here always returns `true`, and
+/// whether a loop masks a `BreakLoop` is instead answered by checking the
+/// accumulated `path` for a loop ancestor.
+#[cfg(not(feature = "no_custom_syntax"))]
+fn contains_escaping_jump(expr: &Expr) -> bool {
+    let mut escapes = false;
+    let mut path = Vec::new();
+
+    expr.walk(&mut path, &mut |path| {
+        match path.last() {
+            Some(ASTNode::Stmt(Stmt::Return(..))) => escapes = true,
+            Some(ASTNode::Stmt(Stmt::BreakLoop(..))) => {
+                let masked = path[..path.len() - 1].iter().any(|node| {
+                    matches!(
+                        node,
+                        ASTNode::Stmt(Stmt::For(..) | Stmt::While(..) | Stmt::Do(..))
+                    )
+                });
+                if !masked {
+                    escapes = true;
+                }
+            }
+            _ => (),
+        }
+        // Always keep walking: `escapes` needs every matching node, not just
+        // the first one `walk`'s early-abort signal would find.
+        true
+    });
+
+    escapes
+}
+
+#[cfg(test)]
+#[cfg(not(feature = "no_function"))]
+mod tests {
+    use super::*;
+    use crate::grain::bytecode::StepFlags;
+
+    /// Lowering order fixes every address inside a function, so it has to come
+    /// from the source rather than from a hash map.
+    ///
+    /// Checks the order itself rather than comparing two artifacts: the seed is
+    /// per process, so two compiles in one process agree either way.
+    #[test]
+    fn functions_are_lowered_in_a_stable_order() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile(
+                "fn zulu(x) { x + 1 }
+                 fn alpha(a, b) { a + b }
+                 fn alpha(a) { a }
+                 fn mike() { 1 }
+                 zulu(1) + alpha(2, 3) + alpha(4) + mike()",
+            )
+            .expect("must compile");
+        let program = Compiler::new().compile(&ast);
+
+        let order: Vec<_> = program
+            .functions()
+            .iter()
+            .map(|f| {
+                (
+                    program.name(f.name).expect("a compiled function is named"),
+                    f.params.len(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            order,
+            [("alpha", 1), ("alpha", 2), ("mike", 0), ("zulu", 1)],
+            "functions must be lowered by name and arity, not by hash",
+        );
+    }
+
+    #[test]
+    fn a_bare_script_function_name_lowers_as_a_named_read() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("fn answer() { 42 } answer")
+            .expect("must compile");
+        let program = Compiler::new().compile(&ast);
+
+        let named_reads: Vec<_> = crate::grain::bytecode::disassemble(program.code())
+            .filter_map(|(.., op)| match op {
+                Op::LoadNamed(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            named_reads
+                .iter()
+                .any(|name| program.name(*name) == Some("answer")),
+            "a bare script-function name should lower into `LoadNamed`, got {named_reads:?}",
+        );
+        assert_eq!(
+            program.residual_count(),
+            0,
+            "lowering a bare script-function name should not leave a residual AST fragment",
+        );
+    }
+
+    #[test]
+    fn a_call_with_bang_lowers() {
+        let engine = crate::Engine::new();
+        let ast = engine.compile("call!(f, 1)").expect("must compile");
+        let program = Compiler::new().compile(&ast);
+        assert_eq!(
+            program.residual_count(),
+            0,
+            "lowering a `call!` should not leave a residual AST fragment",
+        );
+    }
+
+    /// A statement whose value is unit pushes nothing, so nothing has to pop it
+    /// either — [`Lowered::Empty`] is what says so, and an `if` whose branches
+    /// both say it passes it on.
+    ///
+    /// Every statement here is unit but the last, whose value the frame returns,
+    /// so the count is exact rather than a bound: one `Op::Unit` anywhere in
+    /// this program is one the caller then has to discard.
+    #[test]
+    fn a_statement_whose_value_is_unit_pushes_nothing() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("let x = 1; x = 2; x += 3; if x > 0 { x = 4; } x")
+            .expect("must compile");
+        let program = Compiler::new().compile(&ast);
+
+        let stack_traffic: Vec<_> = crate::grain::bytecode::disassemble(program.code())
+            .filter(|(.., op)| matches!(op, Op::Unit | Op::Pop))
+            .collect();
+
+        assert!(
+            stack_traffic.is_empty(),
+            "effect-only statements must leave nothing to discard, found {stack_traffic:?}",
+        );
+    }
+
+    /// Leaving a loop needs no jump. Both ways out arrive at the same address —
+    /// a `break` past the unit the exhausted path pushes — so the instruction
+    /// after the unit is where each of them already was going.
+    ///
+    /// Stated as "no jump lands on the instruction after itself", because that
+    /// is the shape of the mistake rather than the loop it was found in.
+    #[test]
+    fn leaving_a_loop_jumps_nowhere() {
+        let engine = crate::Engine::new();
+
+        for source in [
+            "let s = 0; for i in 0..3 { s += i; } s",
+            "let s = 0; while s < 3 { s += 1; } s",
+            "let s = 0; loop { s += 1; break s }",
+            "let s = 0; do { s += 1; } while s < 3; s",
+        ] {
+            let ast = engine.compile(source).expect("must compile");
+            let program = Compiler::new().compile(&ast);
+
+            let ops: Vec<_> = crate::grain::bytecode::disassemble(program.code()).collect();
+            let idle: Vec<_> = ops
+                .windows(2)
+                .filter(|pair| match pair[0].1 {
+                    Op::Jump(target) => target as usize == pair[1].0,
+                    _ => false,
+                })
+                .map(|pair| pair[0].0)
+                .collect();
+
+            assert!(
+                idle.is_empty(),
+                "`{source}` jumps to the following instruction at {idle:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "no_object"))]
+    fn null_conditional_steps_are_lowered_into_chains() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("let m = #{a: #{b: 1}}; m?.a?.b")
+            .expect("must compile");
+        let program = Compiler::new().compile(&ast);
+
+        let chain = program
+            .chains()
+            .iter()
+            .find(|chain| !chain.steps.is_empty())
+            .expect("the null-conditional expression must lower into a chain");
+
+        assert!(
+            chain.steps.iter().all(|step| match step {
+                Step::Index { flags, .. }
+                | Step::Property { flags, .. }
+                | Step::Method { flags, .. } => flags.contains(StepFlags::SKIP_IF_UNIT),
+            }),
+            "all steps in `m?.a?.b` must short-circuit on unit",
+        );
+    }
+
+    /// A bare script-function name lowers to a named read and resolves to a
+    /// function pointer at run time.
+    #[test]
+    #[cfg(not(any(feature = "no_function", feature = "no_object")))]
+    fn a_script_function_name_is_not_a_variable() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("fn helper() { 1 } let f = helper; f.call()")
+            .expect("must compile");
+        let program = Compiler::new().compile(&ast);
+
+        assert_eq!(
+            program.residual_count(),
+            0,
+            "a script-function name should lower without residual AST fragments",
+        );
+        assert!(
+            crate::grain::bytecode::disassemble(program.code())
+                .any(|(.., op)| matches!(op, Op::LoadNamed(..))),
+            "the lowered program should read `helper` by name",
+        );
+    }
+}
