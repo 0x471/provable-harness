@@ -1,0 +1,42 @@
+# Verify-only fork of TLSNotary v0.1.0-beta.1 (see PATCHES.md, UPSTREAM_COMMIT).
+# Used by ph-core to verify TLSNotary presentations natively and inside the SP1 guest.
+[workspace]
+resolver = "2"
+members = ["tls-core", "core", "attestation"]
+
+[workspace.lints.rust]
+
+[workspace.lints.clippy]
+
+[workspace.dependencies]
+tlsn-core = { path = "core" }
+tlsn-tls-core = { path = "tls-core" }
+
+rangeset = { version = "0.4" }
+bcs = { version = "0.1" }
+blake3 = { version = "1.5" }
+bimap = { version = "0.6" }
+const-oid = { version = "0.10", features = ["db"] }
+futures = { version = "0.3" }
+hmac = { version = "0.12" }
+itybity = { version = "0.2" }
+k256 = { version = "0.13" }
+opaque-debug = { version = "0.3" }
+p256 = { version = "0.13" }
+rand = { version = "0.10" }
+rand_chacha = { version = "0.10" }
+rand_core = { version = "0.10" }
+rs_merkle = { git = "https://github.com/tlsnotary/rs-merkle.git", rev = "85f3e82" }
+rustls-pemfile = { version = "1.0" }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
+rustls-pki-types = { version = "1.12" }
+serde = { version = "1.0" }
+sha2 = { version = "0.10" }
+spki = { version = "0.8", features = ["std"] }
+thiserror = { version = "1.0" }
+tiny-keccak = { version = "2.0" }
+tracing = { version = "0.1" }
+web-time = { version = "0.2" }
+webpki-roots = { version = "1.0" }
+webpki-root-certs = { version = "1.0" }
+zeroize = { version = "1.8" }
