@@ -170,7 +170,10 @@ path = "src/bin/rhai-run.rs"
 
 [dependencies.ahash]
 version = "0.8.4"
-features = ["compile-time-rng"]
+# (provable-harness patch) no "compile-time-rng": it bakes random keys into
+# every build, so the guest ELF and vk were not reproducible. The harness fixes
+# Rhai's hashing seed at runtime (script.rs RHAI_HASHING_SEED).
+features = []
 default-features = false
 
 [dependencies.arbitrary]
@@ -293,3 +296,4 @@ version = "1.1.0"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+

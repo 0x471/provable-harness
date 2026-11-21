@@ -27,3 +27,6 @@ an element costs ~16x a string byte in the zkVM), plus 1 per call. The meter is
 deterministic (it depends only on data sizes), so the native host run and the
 zkVM replay stop at the same point.
 
+Also (`Cargo.toml`): the `ahash` dependency drops `compile-time-rng`, which
+embedded fresh random keys in every compile and made the guest ELF (and so the
+program vk) non-reproducible. Hashing in the harness uses a fixed seed anyway.
