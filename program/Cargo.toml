@@ -1,0 +1,28 @@
+[package]
+name = "ph-program"
+version = "0.1.0"
+edition = "2021"
+description = "SP1 guest: replays a harness session from its witness and commits the claim"
+
+# Own workspace: separate lockfile and precompile patches that only apply in the zkVM.
+[workspace]
+
+[dependencies]
+sp1-zkvm = "=6.10.0"
+ph-core = { path = "../core" }
+
+# SP1 precompile-accelerated crypto (SHA-256 and Ed25519 via curve25519-dalek).
+# Version tags must match the resolved crate versions (sha2 0.10.9, curve25519-dalek 4.1.3,
+# p256 0.13.2, k256 0.13.4, rsa 0.9.6); cargo warns "patch was not used" otherwise.
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-6.10.0" }
+curve25519-dalek = { git = "https://github.com/sp1-patches/curve25519-dalek", tag = "patch-4.1.3-sp1-6.10.0" }
+# zkTLS presentation verification: server ECDSA P-256 / RSA cert chains, k256 notary signatures.
+p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-6.10.0" }
+k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.10.0" }
+rsa = { git = "https://github.com/sp1-patches/RustCrypto-RSA", tag = "patch-0.9.6-sp1-6.10.0" }
+
+[profile.release]
+# One codegen unit: with several, LLVM's cross-unit symbol promotion names
+# (`.llvm.<hash>`) vary between builds, so the ELF and vk were not reproducible.
+codegen-units = 1
