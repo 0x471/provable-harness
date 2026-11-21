@@ -1,0 +1,27 @@
+[package]
+name = "ph-webpki-algs"
+version = "0.1.0"
+description = "Pure-Rust (RustCrypto) signature verification algorithms for rustls-webpki, usable inside the SP1 zkVM"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rustls-pki-types = { version = "1.12", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10.9", features = ["oid"] }
+ecdsa = { version = "0.16", default-features = false, features = ["der", "verifying"] }
+# Exact versions so the SP1 precompile patches (patch-p256-13.2-sp1-6.10.0,
+# RustCrypto-RSA patch-0.9.6-sp1-6.10.0) apply in the guest workspace.
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+rsa = { version = "=0.9.6", default-features = false, features = ["std", "sha2"] }
+
+[dev-dependencies]
+# Differential tests against ring (host only).
+rustls-webpki = { version = "0.103", features = ["ring", "alloc"] }
+ring = "0.17"
+p256 = { version = "=0.13.2", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+rsa = { version = "=0.9.6", features = ["std", "sha2"] }
+rand = "0.8"
+webpki-roots = "1.0"
