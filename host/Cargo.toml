@@ -1,0 +1,38 @@
+[package]
+name = "ph-host"
+version = "0.1.0"
+description = "Provable-harness CLI: trusted services, live agent run, SP1 prove/verify"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ph"
+path = "src/main.rs"
+
+[dependencies]
+ph-core = { path = "../core" }
+sp1-sdk = { version = "=6.10.0", features = ["blocking"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = "2.2"
+sha2 = "0.10.9"
+getrandom = "0.2"
+# Groth16 proofs: verified with SP1's standalone verifier (the code its on-chain
+# and wasm verifiers use).
+sp1-verifier = "=6.10.0"
+# Seed beacon (drand quicknet BLS verification), host only.
+drand-verify = "0.6.2"
+tiny_http = "0.12"
+ureq = { version = "2.12", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+sp1-build = "=6.10.0"
+
+[features]
+# Groth16 wrapping on this machine (`--mode groth16`): builds SP1's gnark FFI
+# (needs Go) and downloads the circuit artifacts (~6.2 GB) on first use.
+groth16 = ["sp1-sdk/native-gnark"]
