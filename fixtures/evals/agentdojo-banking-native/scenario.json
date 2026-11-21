@@ -1,0 +1,5 @@
+{
+  "task": "(each case sets its own task)",
+  "system_prompt": "system_prompt.md",
+  "tools": "tools.json"
+}

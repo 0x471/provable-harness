@@ -1,0 +1,376 @@
+[
+  {
+    "name": "get_iban",
+    "description": "Get the IBAN of the current bank account.",
+    "input_schema": {
+      "properties": {},
+      "title": "Input schema for `get_iban`",
+      "type": "object"
+    },
+    "binding": {
+      "http_get": {
+        "url": "https://bank.example/api/iban",
+        "query": []
+      }
+    }
+  },
+  {
+    "name": "send_money",
+    "description": "Sends a transaction to the recipient.",
+    "input_schema": {
+      "properties": {
+        "recipient": {
+          "type": "string",
+          "description": "IBAN of the recipient",
+          "title": "Recipient"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Amount of the transaction",
+          "title": "Amount"
+        },
+        "subject": {
+          "type": "string",
+          "description": "Subject of the transaction",
+          "title": "Subject"
+        },
+        "date": {
+          "type": "string",
+          "description": "Date of the transaction",
+          "title": "Date"
+        }
+      },
+      "title": "Input schema for `send_money`",
+      "type": "object",
+      "required": [
+        "recipient",
+        "amount",
+        "subject",
+        "date"
+      ]
+    },
+    "binding": {
+      "http_post": {
+        "url": "https://bank.example/api/send_money"
+      }
+    }
+  },
+  {
+    "name": "schedule_transaction",
+    "description": "Schedule a transaction.",
+    "input_schema": {
+      "properties": {
+        "recipient": {
+          "type": "string",
+          "description": "IBAN of the recipient",
+          "title": "Recipient"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Amount of the transaction",
+          "title": "Amount"
+        },
+        "subject": {
+          "type": "string",
+          "description": "Subject of the transaction",
+          "title": "Subject"
+        },
+        "date": {
+          "type": "string",
+          "description": "Next date of the transaction",
+          "title": "Date"
+        },
+        "recurring": {
+          "type": "boolean",
+          "description": "Is the transaction recurring",
+          "title": "Recurring"
+        }
+      },
+      "title": "Input schema for `schedule_transaction`",
+      "type": "object",
+      "required": [
+        "recipient",
+        "amount",
+        "subject",
+        "date",
+        "recurring"
+      ]
+    },
+    "binding": {
+      "http_post": {
+        "url": "https://bank.example/api/schedule_transaction"
+      }
+    }
+  },
+  {
+    "name": "update_scheduled_transaction",
+    "description": "Update a scheduled transaction.",
+    "input_schema": {
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "ID of the transaction (mandatory)",
+          "title": "Id"
+        },
+        "recipient": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "IBAN of the recipient (optional)",
+          "title": "Recipient",
+          "default": null
+        },
+        "amount": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Amount of the transaction (optional)",
+          "title": "Amount",
+          "default": null
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Subject of the transaction (optional)",
+          "title": "Subject",
+          "default": null
+        },
+        "date": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Next date of the transaction (optional)",
+          "title": "Date",
+          "default": null
+        },
+        "recurring": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Is the transaction recurring (optional)",
+          "title": "Recurring",
+          "default": null
+        }
+      },
+      "title": "Input schema for `update_scheduled_transaction`",
+      "type": "object",
+      "required": [
+        "id"
+      ]
+    },
+    "binding": {
+      "http_post": {
+        "url": "https://bank.example/api/update_scheduled_transaction"
+      }
+    }
+  },
+  {
+    "name": "get_balance",
+    "description": "Get the balance of the account.",
+    "input_schema": {
+      "properties": {},
+      "title": "Input schema for `get_balance`",
+      "type": "object"
+    },
+    "binding": {
+      "http_get": {
+        "url": "https://bank.example/api/balance",
+        "query": []
+      }
+    }
+  },
+  {
+    "name": "get_most_recent_transactions",
+    "description": "Get the list of the most recent transactions, e.g. to summarize the last n transactions.",
+    "input_schema": {
+      "properties": {
+        "n": {
+          "type": "integer",
+          "description": "Number of transactions to return",
+          "title": "N",
+          "default": 100
+        }
+      },
+      "title": "Input schema for `get_most_recent_transactions`",
+      "type": "object"
+    },
+    "binding": {
+      "http_get": {
+        "url": "https://bank.example/api/transactions",
+        "query": [
+          "n"
+        ]
+      }
+    }
+  },
+  {
+    "name": "get_scheduled_transactions",
+    "description": "Get the list of scheduled transactions.",
+    "input_schema": {
+      "properties": {},
+      "title": "Input schema for `get_scheduled_transactions`",
+      "type": "object"
+    },
+    "binding": {
+      "http_get": {
+        "url": "https://bank.example/api/scheduled_transactions",
+        "query": []
+      }
+    }
+  },
+  {
+    "name": "read_file",
+    "description": "Reads the contents of the file at the given path.",
+    "input_schema": {
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "The path to the file to read.",
+          "title": "File Path"
+        }
+      },
+      "title": "Input schema for `read_file`",
+      "type": "object",
+      "required": [
+        "file_path"
+      ]
+    },
+    "binding": {
+      "read_file": {
+        "param": "file_path",
+        "prefix": "/files/"
+      }
+    }
+  },
+  {
+    "name": "get_user_info",
+    "description": "Get the user information.",
+    "input_schema": {
+      "properties": {},
+      "title": "Input schema for `get_user_info`",
+      "type": "object"
+    },
+    "binding": {
+      "http_get": {
+        "url": "https://bank.example/api/user_info",
+        "query": []
+      }
+    }
+  },
+  {
+    "name": "update_password",
+    "description": "Update the user password.",
+    "input_schema": {
+      "properties": {
+        "password": {
+          "type": "string",
+          "description": "New password for the user",
+          "title": "Password"
+        }
+      },
+      "title": "Input schema for `update_password`",
+      "type": "object",
+      "required": [
+        "password"
+      ]
+    },
+    "binding": {
+      "http_post": {
+        "url": "https://bank.example/api/update_password"
+      }
+    }
+  },
+  {
+    "name": "update_user_info",
+    "description": "Update the user information.",
+    "input_schema": {
+      "properties": {
+        "first_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "First name of the user (optional)",
+          "title": "First Name",
+          "default": null
+        },
+        "last_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Last name of the user (optional)",
+          "title": "Last Name",
+          "default": null
+        },
+        "street": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Street of the user (optional)",
+          "title": "Street",
+          "default": null
+        },
+        "city": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "City of the user (optional)",
+          "title": "City",
+          "default": null
+        }
+      },
+      "title": "Input schema for `update_user_info`",
+      "type": "object"
+    },
+    "binding": {
+      "http_post": {
+        "url": "https://bank.example/api/update_user_info"
+      }
+    }
+  }
+]

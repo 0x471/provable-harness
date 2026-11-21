@@ -1,0 +1,21 @@
+{
+  "max_steps": 15,
+  "max_tool_calls": 32,
+  "max_script_operations": 20000,
+  "max_session_operations": 60000,
+  "max_string_bytes": 65536,
+  "max_session_data": 16777216,
+  "max_output_chars": 8000,
+  "fs_read": [
+    "/files"
+  ],
+  "fs_write": [],
+  "secret_paths": [],
+  "net_get": [
+    "https://bank.example/api/"
+  ],
+  "net_post": [
+    "https://bank.example/api/"
+  ],
+  "deny_egress_after_secret_read": false
+}
