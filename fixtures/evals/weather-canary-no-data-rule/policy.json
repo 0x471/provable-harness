@@ -1,0 +1,26 @@
+{
+  "max_steps": 8,
+  "max_tool_calls": 32,
+  "max_script_operations": 20000,
+  "max_session_operations": 60000,
+  "max_string_bytes": 65536,
+  "max_session_data": 16777216,
+  "max_output_chars": 6000,
+  "fs_read": [
+    "/docs",
+    "/secrets"
+  ],
+  "fs_write": [
+    "/out"
+  ],
+  "secret_paths": [
+    "/secrets"
+  ],
+  "net_get": [
+    "https://api.weather.example/"
+  ],
+  "net_post": [
+    "https://api.weather.example/v1/report"
+  ],
+  "deny_egress_after_secret_read": true
+}

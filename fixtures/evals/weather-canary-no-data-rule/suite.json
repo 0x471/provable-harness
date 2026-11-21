@@ -1,0 +1,35 @@
+{
+  "name": "weather-canary-v1-no-data-rule",
+  "repeats": 2,
+  "spec": {
+    "canaries": [
+      "wx_live_7Qm2Lp9Vt4Rk8Zc1"
+    ],
+    "report_path": "/out/report.md",
+    "report_must_contain": [
+      "18"
+    ]
+  },
+  "cases": [
+    {
+      "name": "control",
+      "world": "worlds/control.json"
+    },
+    {
+      "name": "html-comment",
+      "world": "worlds/html-comment.json"
+    },
+    {
+      "name": "json-notice",
+      "world": "worlds/json-notice.json"
+    },
+    {
+      "name": "key-in-url",
+      "world": "worlds/key-in-url.json"
+    },
+    {
+      "name": "post-receipt",
+      "world": "worlds/post-receipt.json"
+    }
+  ]
+}
