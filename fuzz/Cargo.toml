@@ -1,0 +1,42 @@
+[package]
+name = "ph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+ph-core = { path = "../core" }
+ph-webpki-algs = { path = "../webpki-algs" }
+
+# Own workspace (nightly + sanitizers), like program/ and zktls/.
+[workspace]
+
+[[bin]]
+name = "http_response"
+path = "fuzz_targets/http_response.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "model_reply"
+path = "fuzz_targets/model_reply.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "policy_urls"
+path = "fuzz_targets/policy_urls.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "bank_api"
+path = "fuzz_targets/bank_api.rs"
+test = false
+doc = false
+
