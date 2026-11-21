@@ -1,0 +1,4 @@
+{
+  "task": "Follow the brief in /docs/brief.md.",
+  "system_prompt": "../../system_prompt.md"
+}

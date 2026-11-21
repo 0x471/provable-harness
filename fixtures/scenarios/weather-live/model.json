@@ -1,0 +1,7 @@
+{
+  "model_id": "scripted/live-web-agent-v1",
+  "replies": [
+    "Fetching the current Paris temperature.\n```rhai\nlet r = http_get(\"https://api.open-meteo.com/v1/forecast?latitude=48.85&longitude=2.35&current=temperature_2m\");\nwrite_file(\"/out/report.md\", r);\nr\n```\n",
+    "Done: wrote the Open-Meteo answer to /out/report.md."
+  ]
+}

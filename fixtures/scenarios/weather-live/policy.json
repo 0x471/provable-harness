@@ -1,0 +1,22 @@
+{
+  "max_steps": 6,
+  "max_tool_calls": 8,
+  "max_script_operations": 20000,
+  "max_session_operations": 60000,
+  "max_string_bytes": 65536,
+  "max_session_data": 16777216,
+  "max_output_chars": 6000,
+  "fs_read": [
+    "/docs",
+    "/out"
+  ],
+  "fs_write": [
+    "/out"
+  ],
+  "secret_paths": [],
+  "net_get": [
+    "https://api.open-meteo.com/v1/forecast"
+  ],
+  "net_post": [],
+  "deny_egress_after_secret_read": true
+}
