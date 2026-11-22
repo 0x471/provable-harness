@@ -100,7 +100,13 @@ impl BoxedString {
         while cap < target_cap {
             cap *= 2;
         }
-        self.realloc(cap)
+        // (provable-harness patch) Reallocate only when the capacity grows.
+        // Under an allocator without in-place realloc (the SP1 zkVM's), a
+        // realloc on every push copies the whole buffer, so appends become
+        // quadratic.
+        if cap != self.cap {
+            self.realloc(cap)
+        }
     }
 
     pub(crate) fn new(cap: usize) -> Self {
