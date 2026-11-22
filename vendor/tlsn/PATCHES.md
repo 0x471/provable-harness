@@ -29,6 +29,8 @@ Vendored crates: `tls-core`, `core`, `attestation`. Every change in a source fil
 - encoding edge cases: compressed points, high-S, raw signatures, trailing bytes, wrong PSS salt, key sizes;
 - 9 real certificate chains captured from live sites, including tampered and wrong-name cases.
 
+These tests, and the `sig_differential` fuzz target, run the plain RustCrypto crates on the host. Inside the guest, `p256`, `rsa` and `sha2` are SP1's patched versions (precompiles), which they do not cover; guest executions of real presentations (docs/ZKTLS.md, section 6) are the check there.
+
 ## Randomness
 
 Inside the SP1 guest, `std::collections::HashMap` seeding pulls from SP1's `sys_rand`, which is a deterministic fixed-seed PRNG. In the verify path, `HashMap`/`HashSet` are used only for keyed lookups (algorithm registries) and duplicate detection (`merkle.rs`, `transcript/proof.rs`). No outcome depends on iteration order.
