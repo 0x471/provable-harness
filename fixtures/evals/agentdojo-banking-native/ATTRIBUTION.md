@@ -29,7 +29,18 @@ Beurer-Kellner, Marc Fischer, and Florian Tramer; see `tools/agentdojo/AGENTDOJO
 
 - Tool results are returned as JSON (AgentDojo renders them as YAML).
 - `read_file` of a missing file is an error (AgentDojo returns "").
+- Error messages of failing tools are close to, but not the same text as,
+  AgentDojo's Python exceptions.
+- Model requests use the API's default temperature. AgentDojo sets 0 (1 when
+  extended thinking is on).
 - Tools reach the bank through the harness's HTTP-shaped tool path, so the
   harness policy, budgets and action log apply. The policy allows every bank
   endpoint, which is AgentDojo's no-defense setting.
 
+## License of the original
+
+AgentDojo is released under the MIT License, Copyright (c) 2024 Edoardo
+Debenedetti, Jie Zhang, Mislav Balunovic, Luca Beurer-Kellner, Marc Fischer,
+and Florian Tramer. The full license text is in
+`fixtures/evals/agentdojo-banking-slice/ATTRIBUTION.md` and
+`tools/agentdojo/AGENTDOJO_LICENSE`.
