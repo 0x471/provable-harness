@@ -1376,7 +1376,8 @@ mod string_functions {
         let mut str_len = string.chars().count();
         let padding_len = padding.chars().count();
 
-        if len <= str_len {
+        // (provable-harness patch) An empty padding looped forever below.
+        if len <= str_len || padding_len == 0 {
             return Ok(());
         }
 
