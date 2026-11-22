@@ -680,3 +680,30 @@ fn action_log_disclosure_and_format_versions() {
     assert!(e.contains("format v2") && e.contains("vk"), "{e}");
     assert_eq!(Witness::from_bytes(&w.to_bytes()).unwrap(), w);
 }
+
+/// The vendored Rhai's faster `drain`, `retain`, `pad` and character
+/// assignment behave exactly like upstream's, including the array left behind
+/// when a callback fails. `pad` with an empty string no longer loops forever.
+#[test]
+fn rewritten_rhai_functions_keep_upstream_behaviour() {
+    let code = r#"
+        let a = [1, 2, 3, 4, 5];
+        let d = a.drain(|x, i| x % 2 == 0);
+        let b = [1, 2, 3, 4, 5];
+        let r = b.retain(|x| x > 2);
+        let c = [1, 2, 3];
+        try { c.drain(|x| if x == 2 { throw "stop" } else { x == 1 }) } catch { }
+        let e = [1, 2, 3];
+        try { e.retain(|x| if x == 3 { throw "stop" } else { x == 2 }) } catch { }
+        let p = "ab"; p.pad(5, "xy");
+        let q = "a"; q.pad(4, 'z');
+        let z = "a"; z.pad(10, "");
+        let w = "héllo"; w[1] = 'e';
+        [a, d, b, r, c, e, p, q, z, w]
+    "#;
+    let (live, w) = live_run(&input(), vec![script(code), "done".into()]);
+    assert_eq!(verify_witness(&w).unwrap().claim, live.claim);
+    let out = &live.messages[2].content;
+    let want = r#"[[1,3,5],[2,4],[3,4,5],[1,2],[2,3],[2,3],"abxyx","azzz","a","hello"]"#;
+    assert!(out.contains(want), "{out}");
+}

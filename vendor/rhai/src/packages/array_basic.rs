@@ -1972,25 +1972,31 @@ pub mod array_functions {
 
         let mut drained = Array::with_capacity(array.len());
 
+        // (provable-harness patch) One pass, instead of a `Vec::remove` per
+        // removed element, which made this quadratic. On an error the array is
+        // left as before: the elements kept so far, then the rest.
+        let mut kept = Array::with_capacity(array.len());
+        let mut rest = std::mem::take(array).into_iter();
         let mut i = 0;
-        let mut x = 0;
 
-        while x < array.len() {
+        while let Some(mut item) = rest.next() {
             let ex = [(i as INT).into()];
 
-            if filter
-                .call_raw_with_extra_args("drain", &ctx, Some(&mut array[x]), [], ex, Some(0))?
-                .as_bool()
-                .unwrap_or(false)
-            {
-                drained.push(array.remove(x));
-            } else {
-                x += 1;
+            match filter.call_raw_with_extra_args("drain", &ctx, Some(&mut item), [], ex, Some(0)) {
+                Ok(r) if r.as_bool().unwrap_or(false) => drained.push(item),
+                Ok(_) => kept.push(item),
+                Err(err) => {
+                    kept.push(item);
+                    kept.extend(rest);
+                    *array = kept;
+                    return Err(err);
+                }
             }
 
             i += 1;
         }
 
+        *array = kept;
         Ok(drained)
     }
     /// Remove all elements in the array within an exclusive `range` and return them as a new array.
@@ -2119,25 +2125,31 @@ pub mod array_functions {
 
         let mut drained = Array::new();
 
+        // (provable-harness patch) One pass, instead of a `Vec::remove` per
+        // removed element, which made this quadratic. On an error the array is
+        // left as before: the elements kept so far, then the rest.
+        let mut kept = Array::with_capacity(array.len());
+        let mut rest = std::mem::take(array).into_iter();
         let mut i = 0;
-        let mut x = 0;
 
-        while x < array.len() {
+        while let Some(mut item) = rest.next() {
             let ex = [(i as INT).into()];
 
-            if filter
-                .call_raw_with_extra_args("retain", &ctx, Some(&mut array[x]), [], ex, Some(0))?
-                .as_bool()
-                .unwrap_or(false)
-            {
-                x += 1;
-            } else {
-                drained.push(array.remove(x));
+            match filter.call_raw_with_extra_args("retain", &ctx, Some(&mut item), [], ex, Some(0)) {
+                Ok(r) if r.as_bool().unwrap_or(false) => kept.push(item),
+                Ok(_) => drained.push(item),
+                Err(err) => {
+                    kept.push(item);
+                    kept.extend(rest);
+                    *array = kept;
+                    return Err(err);
+                }
             }
 
             i += 1;
         }
 
+        *array = kept;
         Ok(drained)
     }
     /// Remove all elements in the array not within an exclusive `range` and return them as a new array.
