@@ -519,6 +519,9 @@ pub(crate) fn build_engine(env: &Rc<RefCell<ToolEnv>>, policy: &Policy) -> Engin
         .set_max_map_size(4096)
         .set_max_call_levels(32)
         .set_max_expr_depths(64, 32);
+    // The optimizer folds constants at compile time, where no meter runs: a few
+    // nested `const` arrays built 10^6 elements before the script started.
+    engine.set_optimization_level(rhai::OptimizationLevel::None);
     engine.disable_symbol("eval");
     // Rhai's core package ships `sleep`, which would block the live host and
     // panic inside the zkVM (no threads). The harness must never touch the OS.
