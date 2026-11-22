@@ -887,6 +887,8 @@ impl Engine {
                     let swap = is_ref_mut && !args.is_empty();
 
                     if swap {
+                        // (provable-harness patch) The copy clones the argument.
+                        self.track_clone_volume(&*args[0], pos)?;
                         backup.change_first_arg_to_copy(args);
                     }
 

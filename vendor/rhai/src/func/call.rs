@@ -73,6 +73,8 @@ impl Engine {
             // Handle fn_ptr.call(...)
             KEYWORD_FN_PTR_CALL if target.as_ref().is_fnptr() => {
                 let fn_ptr = target.as_ref().read_lock::<FnPtr>().unwrap();
+                // (provable-harness patch) Calling clones the curried values.
+                self.track_curry_volume(fn_ptr.curry(), pos)?;
                 let curry = &mut fn_ptr.curry().iter().cloned().collect::<FnArgsVec<_>>();
 
                 // Arguments are passed as-is, adding the curried arguments
@@ -264,6 +266,8 @@ impl Engine {
                         self.make_type_mismatch_err::<FnPtr>(self.map_type_name(typ), pos)
                     })?
                     .clone();
+                // (provable-harness patch) Currying clones the curried values.
+                self.track_curry_volume(fn_ptr.curry(), pos)?;
 
                 // Append the new curried arguments to the existing list.
                 fn_ptr.extend(call_args.iter_mut().map(std::mem::take));
@@ -294,6 +298,8 @@ impl Engine {
                             fn_name = &_redirected;
                             // Add curried arguments
                             if fn_ptr.is_curried() {
+                                // (provable-harness patch) Calling clones the curried values.
+                                self.track_curry_volume(fn_ptr.curry(), pos)?;
                                 _arg_values = fn_ptr
                                     .curry()
                                     .iter()

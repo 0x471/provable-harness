@@ -446,6 +446,10 @@ impl FnPtr {
         let mut args_data: FnArgsVec<_>;
 
         if self.is_curried() {
+            // (provable-harness patch) Calling clones the curried values.
+            context
+                .engine()
+                .track_curry_volume(self.curry(), context.call_position())?;
             args_data = self
                 .curry()
                 .iter()

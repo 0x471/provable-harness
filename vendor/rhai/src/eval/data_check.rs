@@ -119,9 +119,56 @@ pub fn calc_data_sizes(value: &Dynamic, _top: bool) -> (usize, usize, usize) {
     }
 }
 
-/// (provable-harness patch) Meter units per array or map element: walking an
-/// element costs about 16x as many zkVM cycles as a string byte.
+/// (provable-harness patch) Meter units per array or map element, map entry or
+/// curried value: walking one costs about 16x as many zkVM cycles as a string
+/// byte.
 pub const ELEMENT_WEIGHT: usize = 16;
+
+/// (provable-harness patch) Meter units per native function call. A call costs
+/// about as many zkVM cycles as 64 string bytes, also when a native function
+/// calls another one (`contains`, `==` on arrays, `sort`), which no operation
+/// counter sees.
+pub const CALL_WEIGHT: usize = 64;
+
+/// (provable-harness patch) Meter units per array, map, BLOB or function
+/// pointer: cloning or dropping one allocates or frees, about 1000 zkVM cycles
+/// (nested arrays, or arrays of small maps, cost that per element).
+pub const CONTAINER_WEIGHT: usize = 96;
+
+/// (provable-harness patch) Meter units for walking a value (`strings`), or for
+/// cloning it (strings are reference-counted, so cloning them is O(1)): string
+/// bytes, elements, map keys (copied by a clone) and the curried values of
+/// function pointers, which Rhai's own size checks skip. A shared value inside
+/// another one (a closure's captured variable) is a reference-counted pointer:
+/// it counts as one element and is not followed, so reference cycles end.
+pub(crate) fn meter_units(value: &Dynamic, strings: bool) -> usize {
+    match value.0 {
+        #[cfg(not(feature = "no_closure"))]
+        Union::Shared(..) => value
+            .read_lock::<Dynamic>()
+            .map_or(ELEMENT_WEIGHT, |v| meter_units_inner(&v, strings)),
+        _ => meter_units_inner(value, strings),
+    }
+}
+
+fn meter_units_inner(value: &Dynamic, strings: bool) -> usize {
+    let each = |v: &Dynamic| ELEMENT_WEIGHT + meter_units_inner(v, strings);
+    match value.0 {
+        Union::Str(ref s, ..) if strings => s.len(),
+        #[cfg(not(feature = "no_index"))]
+        Union::Array(ref a, ..) => CONTAINER_WEIGHT + a.iter().map(each).sum::<usize>(),
+        #[cfg(not(feature = "no_index"))]
+        Union::Blob(ref b, ..) => CONTAINER_WEIGHT + b.len(),
+        #[cfg(not(feature = "no_object"))]
+        Union::Map(ref m, ..) => {
+            CONTAINER_WEIGHT + m.iter().map(|(k, v)| k.len() + each(v)).sum::<usize>()
+        }
+        Union::FnPtr(ref f, ..) => CONTAINER_WEIGHT + f.curry().iter().map(each).sum::<usize>(),
+        #[cfg(not(feature = "no_closure"))]
+        Union::Shared(..) => ELEMENT_WEIGHT,
+        _ => 0,
+    }
+}
 
 impl Engine {
     /// (provable-harness patch) Charge `units` to the data-volume meter.
@@ -135,42 +182,45 @@ impl Engine {
         Ok(())
     }
 
-    /// (provable-harness patch) Charge the full size of a value (string bytes,
-    /// array and map elements).
+    /// (provable-harness patch) Charge the full size of a value.
     #[inline]
     pub(crate) fn track_value_volume(&self, value: &Dynamic, pos: Position) -> RhaiResultOf<()> {
         if self.data_volume.is_none() {
             return Ok(());
         }
-        let (a, m, s) = calc_data_sizes(value, true);
-        self.track_data_volume(1 + ELEMENT_WEIGHT * (a + m) + s, pos)
+        self.track_data_volume(1 + meter_units(value, true), pos)
     }
 
-    /// (provable-harness patch) Charge a value about to be cloned: its array
-    /// and map elements (strings are reference-counted, so cloning them is O(1)).
+    /// (provable-harness patch) Charge a value about to be cloned.
     #[inline]
     pub(crate) fn track_clone_volume(&self, value: &Dynamic, pos: Position) -> RhaiResultOf<()> {
         if self.data_volume.is_none() {
             return Ok(());
         }
-        let (a, m, _) = calc_data_sizes(value, true);
-        self.track_data_volume(ELEMENT_WEIGHT * (a + m), pos)
+        self.track_data_volume(meter_units(value, false), pos)
     }
 
-    /// (provable-harness patch) Charge the arguments of a function call.
+    /// (provable-harness patch) Charge curried values about to be cloned.
+    #[inline]
+    pub(crate) fn track_curry_volume(&self, curry: &[Dynamic], pos: Position) -> RhaiResultOf<()> {
+        if self.data_volume.is_none() || curry.is_empty() {
+            return Ok(());
+        }
+        let units = curry
+            .iter()
+            .map(|v| ELEMENT_WEIGHT + meter_units(v, false))
+            .sum::<usize>();
+        self.track_data_volume(units, pos)
+    }
+
+    /// (provable-harness patch) Charge a native function call and its arguments.
     #[inline]
     pub(crate) fn track_args_volume(&self, args: &[&mut Dynamic], pos: Position) -> RhaiResultOf<()> {
         if self.data_volume.is_none() {
             return Ok(());
         }
-        let units = args
-            .iter()
-            .map(|v| {
-                let (a, m, s) = calc_data_sizes(v, true);
-                ELEMENT_WEIGHT * (a + m) + s
-            })
-            .sum::<usize>();
-        self.track_data_volume(1 + units, pos)
+        let units = args.iter().map(|v| meter_units(v, true)).sum::<usize>();
+        self.track_data_volume(CALL_WEIGHT + units, pos)
     }
 
     /// Raise an error if any data size exceeds limit.
