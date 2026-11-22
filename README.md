@@ -1,12 +1,31 @@
 # provable-harness
 
-An AI agent harness whose runs can be proven.
+An AI agent harness whose runs can be proven. Status: research prototype, not audited.
+
+## Contents
+
+**The idea**
+- [What it is](#what-it-is)
+- [Why](#why)
+- [What a verified proof tells you](#what-a-verified-proof-tells-you)
+- [Use cases](#use-cases)
+
+**How it works**
+- [Overview](#how-it-works)
+- [What the SP1 proof checks](#what-the-sp1-proof-checks)
+- [How a zkTLS reply is checked inside the proof](#how-a-zktls-reply-is-checked-inside-the-proof)
+- [Threat model](#threat-model)
+
+**Using it**
+- [Quick start](#quick-start)
+- [zkTLS mode](#zktls-mode)
+- [Provable evals](#provable-evals)
+- [Results](#results)
+- [Repository layout](#repository-layout)
+
+## What it is
 
 The agent runs as usual. Afterwards, the [SP1](https://github.com/succinctlabs/sp1) zkVM replays the same harness code over a recording of the run and produces a proof. Anyone can check that proof in about two seconds and learn what the model was shown, which tools it called with which arguments, what the policy allowed or blocked, and how the run ended, without trusting the person who ran it.
-
-Status: research prototype, not audited.
-
-Contents: [Why](#why) | [What a proof tells you](#what-a-verified-proof-tells-you) | [Use cases](#use-cases) | [How it works](#how-it-works) | [What SP1 checks](#what-the-sp1-proof-checks) | [zkTLS inside the proof](#how-a-zktls-reply-is-checked-inside-the-proof) | [Threat model](#threat-model) | [Quick start](#quick-start) | [Evals](#provable-evals) | [Results](#results) | [Layout](#repository-layout)
 
 ## Why
 
