@@ -223,6 +223,37 @@ mod chain_cache {
         b
     }
 
+    /// A synthetic chain whose intermediate expires (2026-12-01) before the leaf
+    /// does (2027-06-01), and whose leaf starts (2026-06-01) after it: a cache
+    /// that kept only the leaf's window would accept the chain after the
+    /// intermediate expired. (The real fixture chain cannot show that: its
+    /// leaf's window lies inside every other certificate's.)
+    #[test]
+    fn cache_keeps_every_certificates_window() {
+        use tlsn_core::webpki::RootCertStore;
+        let der = |n: &str| {
+            let p = format!("{}/tests/fixtures/window-{n}.der", env!("CARGO_MANIFEST_DIR"));
+            CertificateDer(std::fs::read(p).unwrap())
+        };
+        let (leaf, inter) = (der("leaf"), vec![der("inter")]);
+        let verifier = || ServerCertVerifier::new(&RootCertStore { roots: vec![der("root")] }).unwrap();
+        let host = name("test.example");
+        const DAY: u64 = 86_400;
+        let jan26 = 1_767_225_600;
+        let (mar26, jun26, jul26) = (jan26 + 59 * DAY, jan26 + 151 * DAY, jan26 + 181 * DAY);
+        let (dec26, jan27) = (jan26 + 334 * DAY, jan26 + 365 * DAY);
+        let fresh = verifier();
+        let ok = |t| fresh.verify_server_cert_uncached(&leaf, &inter, &host, t).is_ok();
+        assert!(ok(jul26));
+        assert!(!ok(mar26), "the leaf is not valid yet");
+        assert!(!ok(jan27), "the intermediate has expired, the leaf has not");
+        let cached = verifier();
+        cached.verify_server_cert(&leaf, &inter, &host, jul26).unwrap();
+        for t in [0, mar26, jun26 - 1, jun26, jul26, dec26 - 1, dec26, dec26 + 1, jan27, 4_000_000_000] {
+            assert_eq!(cached.verify_server_cert(&leaf, &inter, &host, t).is_ok(), ok(t), "t={t}");
+        }
+    }
+
     #[test]
     fn cached_and_uncached_decisions_agree() {
         let (leaf, inter) = anthropic_chain();
