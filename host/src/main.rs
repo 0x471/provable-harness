@@ -567,6 +567,11 @@ fn cmd_verify(run: &Path, scenario: &Scenario, keys: &Path, x: &Expect<'_>) -> R
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let (ok, detail) = match (claim.tls_time_range, tls_max_age_secs) {
+            // zkTLS tools with a gateway model: nothing is notarized if the
+            // session made no external call.
+            (None, _) if zktls.is_none() && claim.external_calls == 0 => {
+                (true, "none (no external call)".to_string())
+            }
             (None, _) => (false, "no notarized time in claim".to_string()),
             (Some((a, b)), max_age) => {
                 let fresh = max_age.is_none_or(|m| now.saturating_sub(a) <= m);
