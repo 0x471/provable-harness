@@ -115,6 +115,21 @@ impl SignatureVerifier for PhNotaryVerifier {
     }
 }
 
+/// Refuses every signature. Installed over TLSNotary's built-in schemes, so a
+/// presentation signed under any of them fails inside `verify` already, not
+/// only at the scheme check after it.
+struct Refuse(SignatureAlgId);
+
+impl SignatureVerifier for Refuse {
+    fn alg_id(&self) -> SignatureAlgId {
+        self.0
+    }
+
+    fn verify(&self, _: &VerifyingKey, _: &[u8], _: &[u8]) -> Result<(), SignatureError> {
+        Err(SignatureError::from_str("only the ph notary signature scheme is accepted"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZkTlsConfig {
     pub notary: NotaryKey,
@@ -290,6 +305,9 @@ pub fn provider_for_roots(roots: &TlsRoots) -> Result<CryptoProvider, String> {
             ..Default::default()
         },
     };
+    for alg in [SignatureAlgId::SECP256K1, SignatureAlgId::SECP256R1, SignatureAlgId::SECP256K1ETH] {
+        p.signature.set_verifier(Box::new(Refuse(alg)));
+    }
     p.signature.set_verifier(Box::new(PhNotaryVerifier));
     Ok(p)
 }

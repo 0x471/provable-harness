@@ -162,17 +162,24 @@ fn model_level_checks_bind_slot_and_request() {
 #[test]
 fn only_the_ph_notary_scheme_is_accepted() {
     use tlsn_attestation::signing::{Secp256k1EthSigner, Secp256k1Signer, Signer};
+    use tlsn_core::webpki::{CertificateDer, RootCertStore, ServerCertVerifier};
     let c = pinned();
     let p = crypto_provider(&c).unwrap();
+    let ph_core::TlsRoots::Custom(roots) = &c.roots else { panic!("the fixture pins the mock CA") };
+    let upstream = tlsn_attestation::CryptoProvider {
+        cert: ServerCertVerifier::new(&RootCertStore { roots: roots.iter().map(|r| CertificateDer(r.clone())).collect() })
+            .unwrap(),
+        ..Default::default()
+    };
     // Same key, other schemes. Each is a valid TLSNotary presentation...
     let plain = resigned(1, |h| Secp256k1Signer::new(&NOTARY_SECRET).unwrap().sign(h).unwrap().data);
     let eth = resigned(3, |h| Secp256k1EthSigner::new(&NOTARY_SECRET).unwrap().sign(h).unwrap().data);
     for (name, bytes) in [("secp256k1 (upstream notary)", plain), ("secp256k1eth", eth)] {
         let pres: tlsn_attestation::presentation::Presentation = bincode::deserialize(&bytes).unwrap();
-        pres.verify(&p).unwrap_or_else(|e| panic!("{name} should verify under upstream rules: {e}"));
-        // ...but the harness accepts only the ph notary scheme.
+        pres.verify(&upstream).unwrap_or_else(|e| panic!("{name} should verify under upstream rules: {e}"));
+        // ...but the harness's provider refuses every scheme but the ph one.
         let e = verify_presentation(&p, &c.notary, &c.host, &bytes).unwrap_err();
-        assert!(e.contains("signature scheme"), "{name}: {e}");
+        assert!(e.contains("only the ph notary signature scheme"), "{name}: {e}");
     }
     // Re-signing under the ph scheme with the right key reproduces an accepted presentation.
     let again = resigned(PH_NOTARY_SIG_ALG_ID, |h| ph_sign(&NOTARY_SECRET, h));
