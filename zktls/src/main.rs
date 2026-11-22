@@ -376,7 +376,18 @@ fn main() -> Result<()> {
         Cmd::Keygen { out } => {
             let mut secret = [0u8; 32];
             getrandom::getrandom(&mut secret)?;
-            std::fs::write(&out, hex::encode(secret))?;
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                // Owner-only, and never over an existing key.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&out)
+                    .with_context(|| format!("creating {}", out.display()))?
+                    .write_all(hex::encode(secret).as_bytes())?;
+            }
             println!("{}", hex::encode(notary_public_key(&secret)?));
         }
         Cmd::Config {
