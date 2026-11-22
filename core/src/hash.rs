@@ -40,6 +40,7 @@ pub mod domain {
     pub const NOTARY_LOG: &str = "ph/v1/notary-session-log";
     pub const CLAIM_SALT: &str = "ph/v1/claim-salt";
     pub const SALTED: &str = "ph/v1/salted-commitment";
+    pub const NOTARY_PREREG: &str = "ph/v1/notary-prereg-receipt";
 }
 
 pub struct Hasher(Sha256);

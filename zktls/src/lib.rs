@@ -36,6 +36,7 @@ use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use ph_core::notary_log::PreregRecord;
 use ph_core::zktls::SLOT_EXTENSION_ID;
 use ph_core::{Slot, SlotKind};
 use tlsn::{
@@ -130,37 +131,66 @@ struct StateInner {
 }
 
 /// First line of a journal: format version and the notary key it belongs to.
-/// v3 adds `D` records (attestation signed). A v2 journal cannot tell signed
-/// slots from aborted ones, so it is refused: start a new journal with a new
-/// notary key (a fresh journal under the old key would allow re-rolls).
-const JOURNAL_HEADER: &str = "PH-NOTARY-JOURNAL v3";
+/// v3 added `D` records (attestation signed), v4 `P` records (pre-registrations).
+/// Older journals are refused: start a new journal with a new notary key (a
+/// fresh journal under the old key would allow re-rolls).
+const JOURNAL_HEADER: &str = "PH-NOTARY-JOURNAL v4";
 
 fn journal_line(op: u8, slot: &Slot) -> Vec<u8> {
     format!("{} {}\n", op as char, slot.to_text()).into_bytes()
 }
 
-fn parse_journal_line(line: &[u8]) -> Option<(u8, Slot)> {
+fn prereg_line(p: &PreregRecord) -> Vec<u8> {
+    format!("P {} {} {}\n", p.suite, p.prereg, p.time).into_bytes()
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+enum Record {
+    Slot(u8, Slot),
+    Prereg(PreregRecord),
+}
+
+fn parse_journal_line(line: &[u8]) -> Option<Record> {
     let (&op, rest) = line.split_first()?;
-    if !matches!(op, b'C' | b'R' | b'D') || rest.first() != Some(&b' ') {
+    if rest.first() != Some(&b' ') {
         return None;
     }
-    Some((op, Slot::parse_text(std::str::from_utf8(&rest[1..]).ok()?)?))
+    let text = std::str::from_utf8(&rest[1..]).ok()?;
+    match op {
+        b'C' | b'R' | b'D' => Some(Record::Slot(op, Slot::parse_text(text)?)),
+        b'P' => {
+            let mut it = text.split(' ');
+            let (suite, prereg, time) = (it.next()?, it.next()?, it.next()?);
+            if it.next().is_some() || !is_hex64(suite) || !is_hex64(prereg) {
+                return None;
+            }
+            let time: u64 = time.parse().ok().filter(|_| !time.starts_with('0') || time == "0")?;
+            Some(Record::Prereg(PreregRecord { suite: suite.into(), prereg: prereg.into(), time }))
+        }
+        _ => None,
+    }
+}
+
+/// What a journal holds: the consumed slots, each slot's event history (e.g.
+/// "CD", "CDRCD", "C") and the pre-registrations in order.
+#[derive(Default)]
+struct Journal {
+    consumed: HashSet<Slot>,
+    histories: std::collections::BTreeMap<Slot, String>,
+    preregs: Vec<PreregRecord>,
 }
 
 /// Replay the complete records of a journal (`data` up to and including its
-/// last newline; the first line is the header). Returns the consumed set and
-/// each slot's event history (e.g. "CD", "CDRCD", "C").
-fn replay_journal(
-    data: &[u8],
-    key_line: &[u8],
-    path: &std::path::Path,
-) -> Result<(HashSet<Slot>, std::collections::BTreeMap<Slot, String>)> {
-    let mut consumed = HashSet::new();
-    let mut histories: std::collections::BTreeMap<Slot, String> = Default::default();
+/// last newline; the first line is the header).
+fn replay_journal(data: &[u8], key_line: &[u8], path: &std::path::Path) -> Result<Journal> {
+    let mut j = Journal::default();
     // Strip the final newline so every remaining segment is one record (an
     // empty segment, i.e. a blank line, is malformed).
     let Some(records) = data.strip_suffix(b"\n") else {
-        return Ok((consumed, histories));
+        return Ok(j);
     };
     let mut lines = records.split(|&b| b == b'\n').enumerate();
     if let Some((_, first)) = lines.next() {
@@ -172,39 +202,49 @@ fn replay_journal(
         }
     }
     for (n, line) in lines {
-        let (op, slot) = parse_journal_line(line)
-            .ok_or_else(|| anyhow!("notary journal line {}: malformed", n + 1))?;
+        let (op, slot) = match parse_journal_line(line) {
+            Some(Record::Slot(op, slot)) => (op, slot),
+            Some(Record::Prereg(p)) => {
+                j.preregs.push(p);
+                continue;
+            }
+            None => bail!("notary journal line {}: malformed", n + 1),
+        };
         let ok = match op {
-            b'C' => consumed.insert(slot),
-            b'R' => consumed.remove(&slot),
+            b'C' => j.consumed.insert(slot),
+            b'R' => j.consumed.remove(&slot),
             // D (attestation signed) only for a currently consumed slot.
-            _ => consumed.contains(&slot),
+            _ => j.consumed.contains(&slot),
         };
         if !ok {
             bail!("notary journal line {}: inconsistent with earlier lines", n + 1);
         }
-        histories.entry(slot).or_default().push(op as char);
+        j.histories.entry(slot).or_default().push(op as char);
     }
-    Ok((consumed, histories))
+    Ok(j)
 }
 
 fn journal_key_line(notary_key: &[u8]) -> Vec<u8> {
     format!("{JOURNAL_HEADER} {}", hex::encode(notary_key)).into_bytes()
 }
 
-/// Read a journal without taking its lock (the running notary holds it) and
-/// return each slot's event history. A torn last line is ignored (it was never
-/// acted on).
-pub fn read_journal_histories(
-    path: &std::path::Path,
-    notary_key: &[u8],
-) -> Result<std::collections::BTreeMap<Slot, String>> {
+/// Read a journal without taking its lock (the running notary holds it): each
+/// slot's event history and the pre-registrations. A torn last line is ignored
+/// (it was never acted on).
+fn read_journal(path: &std::path::Path, notary_key: &[u8]) -> Result<Journal> {
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     if complete == 0 {
         bail!("journal {} is empty", path.display());
     }
-    Ok(replay_journal(&data[..complete], &journal_key_line(notary_key), path)?.1)
+    replay_journal(&data[..complete], &journal_key_line(notary_key), path)
+}
+
+pub fn read_journal_histories(
+    path: &std::path::Path,
+    notary_key: &[u8],
+) -> Result<std::collections::BTreeMap<Slot, String>> {
+    Ok(read_journal(path, notary_key)?.histories)
 }
 
 impl NotaryState {
@@ -243,13 +283,25 @@ impl NotaryState {
             file.write_all(b"\n")?;
             file.sync_all()?;
         }
-        let (consumed, _) = replay_journal(&data[..complete], &key_line, path)?;
+        let consumed = replay_journal(&data[..complete], &key_line, path)?.consumed;
         Ok(Self {
             inner: Mutex::new(StateInner {
                 consumed,
                 journal: Some(file),
             }),
         })
+    }
+
+    /// Record a pre-registration with the notary's clock, *before* the receipt
+    /// is sent. Every session log lists it.
+    pub fn record_prereg(&self, p: &PreregRecord) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(f) = g.journal.as_mut() {
+            use std::io::Write;
+            f.write_all(&prereg_line(p))?;
+            f.sync_data()?;
+        }
+        Ok(())
     }
 
     /// Mark `slot` consumed. Ok(false) if it already was. On a journal write
@@ -377,8 +429,27 @@ impl NotaryAccess {
     }
 }
 
-/// Read the optional `PH-AUTH <token>` line and the intent line.
-async fn read_opening<S: AsyncRead + Unpin>(socket: &mut S, access: &NotaryAccess) -> Result<Slot> {
+const PREREG_PREFIX: &[u8] = b"PH-PREREG ";
+
+/// What a connection asks for.
+enum Opening {
+    /// Notarize one exchange under this slot.
+    Intent(Slot),
+    /// Time-stamp an eval pre-registration: (suite hash, pre-registration hash).
+    Prereg([u8; 32], [u8; 32]),
+}
+
+fn parse_prereg(line: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    let rest = std::str::from_utf8(line.strip_prefix(PREREG_PREFIX)?).ok()?;
+    let (suite, prereg) = rest.split_once(' ')?;
+    if !is_hex64(suite) || !is_hex64(prereg) {
+        return None;
+    }
+    Some((ph_core::hash::from_hex32(suite)?, ph_core::hash::from_hex32(prereg)?))
+}
+
+/// Read the optional `PH-AUTH <token>` line and the request line.
+async fn read_opening<S: AsyncRead + Unpin>(socket: &mut S, access: &NotaryAccess) -> Result<Opening> {
     let mut line = read_line(socket).await?;
     let mut authed = !access.required();
     if let Some(token) = line.strip_prefix(AUTH_PREFIX) {
@@ -388,7 +459,25 @@ async fn read_opening<S: AsyncRead + Unpin>(socket: &mut S, access: &NotaryAcces
     if !authed {
         bail!("operator not authorized");
     }
-    parse_intent(&line).ok_or_else(|| anyhow!("malformed intent line"))
+    if let Some((suite, prereg)) = parse_prereg(&line) {
+        return Ok(Opening::Prereg(suite, prereg));
+    }
+    parse_intent(&line).map(Opening::Intent).ok_or_else(|| anyhow!("malformed intent line"))
+}
+
+/// Journal a pre-registration with the notary's clock, then sign the receipt:
+/// `OK <time> <signature hex>`.
+fn prereg_receipt(state: &NotaryState, secret: &[u8; 32], suite: &[u8; 32], prereg: &[u8; 32]) -> Result<String> {
+    use k256::ecdsa::signature::Signer as _;
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    state.record_prereg(&PreregRecord {
+        suite: hex::encode(suite),
+        prereg: hex::encode(prereg),
+        time,
+    })?;
+    let sk = k256::ecdsa::SigningKey::from_bytes(secret.into())?;
+    let sig: k256::ecdsa::Signature = sk.sign(&ph_core::notary_log::prereg_receipt_digest(suite, prereg, time));
+    Ok(format!("OK {time} {}\n", hex::encode(sig.to_vec())))
 }
 
 /// Time allowed for the opening lines, and for the whole MPC-TLS exchange.
@@ -479,7 +568,16 @@ pub async fn notary_session<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 's
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let intent = match tokio::time::timeout(OPENING_TIMEOUT, read_opening(&mut socket, &access)).await {
-        Ok(Ok(slot)) => slot,
+        Ok(Ok(Opening::Intent(slot))) => slot,
+        Ok(Ok(Opening::Prereg(suite, prereg))) => {
+            let reply = match prereg_receipt(&state, &secret, &suite, &prereg) {
+                Ok(r) => r,
+                Err(e) => format!("REFUSED notary state unavailable: {e:#}\n"),
+            };
+            socket.write_all(reply.as_bytes()).await?;
+            eprintln!("[notary] pre-registration {}.. for suite {}..", &hex::encode(prereg)[..8], &hex::encode(suite)[..8]);
+            return Ok(());
+        }
         Ok(Err(e)) => {
             let _ = socket.write_all(format!("REFUSED {e}\n").as_bytes()).await;
             return Err(e);
@@ -641,7 +739,7 @@ pub fn signed_session_log(
 ) -> Result<ph_core::notary_log::SessionLog> {
     use k256::ecdsa::signature::Signer as _;
     let key = notary_public_key(secret)?;
-    let histories = read_journal_histories(journal, &key)?;
+    let Journal { histories, preregs, .. } = read_journal(journal, &key)?;
     let mut sessions: Vec<String> = sessions.to_vec();
     sessions.sort();
     sessions.dedup();
@@ -661,6 +759,7 @@ pub fn signed_session_log(
         generated_at: now,
         sessions,
         slots,
+        preregs,
         signature: vec![],
     };
     let sk = k256::ecdsa::SigningKey::from_bytes(secret.into())?;
@@ -1200,13 +1299,14 @@ mod tests {
         let header = format!("{} {}\n", super::JOURNAL_HEADER, "02".repeat(33));
         // Control: a well-formed journal with every record kind opens, and its
         // histories read back (so the cases below fail for their own reason).
-        let good = format!("C model {hex} 1\nD model {hex} 1\nR model {hex} 1\nC model {hex} 1\nD model {hex} 1\nC tool {hex} 2\n");
+        let good = format!("C model {hex} 1\nD model {hex} 1\nR model {hex} 1\nC model {hex} 1\nD model {hex} 1\nC tool {hex} 2\nP {hex} {hex} 1795300000\n");
         let path = tmp_journal("good");
         std::fs::write(&path, format!("{header}{good}")).unwrap();
         drop(NotaryState::open(&path, &[2u8; 33]).unwrap());
         let h = super::read_journal_histories(&path, &[2u8; 33]).unwrap();
         assert_eq!(h[&Slot::model(&[0xab; 32], 1)], "CDRCD");
         assert_eq!(h[&Slot::tool(&[0xab; 32], 2)], "C");
+        assert_eq!(super::read_journal(&path, &[2u8; 33]).unwrap().preregs.len(), 1);
         assert!(super::read_journal_histories(&path, &[3u8; 33]).is_err());
         let _ = std::fs::remove_file(&path);
         for (with_header, bad) in [
@@ -1219,9 +1319,15 @@ mod tests {
             // D only for a consumed slot.
             (true, format!("D model {hex} 1\n")),
             (true, format!("C model {hex} 1\nR model {hex} 1\nD model {hex} 1\n")),
+            // Pre-registrations: two hashes and a decimal time.
+            (true, format!("P {hex} {hex}\n")),
+            (true, format!("P {hex} {hex} 01\n")),
+            (true, format!("P {hex} {} 1\n", "AB".repeat(32))),
+            (true, format!("P {hex} {hex} 1 2\n")),
             // Old journals are refused rather than misread (v2 has no D records).
             (false, format!("K {}\nC {hex} 1\n", "02".repeat(33))),
             (false, format!("PH-NOTARY-JOURNAL v2 {}\nC model {hex} 1\n", "02".repeat(33))),
+            (false, format!("PH-NOTARY-JOURNAL v3 {}\nC model {hex} 1\n", "02".repeat(33))),
         ] {
             let path = tmp_journal("corrupt");
             let text = if with_header { format!("{header}{bad}") } else { bad.clone() };
@@ -1229,6 +1335,33 @@ mod tests {
             assert!(NotaryState::open(&path, &[2u8; 33]).is_err(), "{bad:?}");
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// A pre-registration receipt verifies under the notary key with ph-core's
+    /// check, and the session log lists every pre-registration.
+    #[test]
+    fn prereg_receipt_and_log() {
+        let path = tmp_journal("prereg");
+        let secret = [7u8; 32];
+        let key = super::notary_public_key(&secret).unwrap();
+        let state = NotaryState::open(&path, &key).unwrap();
+        let (suite, prereg) = ([1u8; 32], [2u8; 32]);
+        let reply = super::prereg_receipt(&state, &secret, &suite, &prereg).unwrap();
+        let mut it = reply.trim_end().split(' ');
+        assert_eq!(it.next(), Some("OK"));
+        let time: u64 = it.next().unwrap().parse().unwrap();
+        let sig = hex::decode(it.next().unwrap()).unwrap();
+        let pinned = ph_core::NotaryKey { alg: "k256".into(), key: key.clone() };
+        let v = |s: &[u8; 32], p: &[u8; 32], t| ph_core::notary_log::verify_prereg_receipt(&pinned, s, p, t, &sig);
+        assert!(v(&suite, &prereg, time).is_ok());
+        assert!(v(&suite, &prereg, time - 1).is_err());
+        assert!(v(&prereg, &suite, time).is_err());
+        drop(state);
+        let log = super::signed_session_log(&path, &secret, &["ab".repeat(32)], time).unwrap();
+        assert!(log.verify(&pinned).is_ok());
+        assert_eq!(log.preregs.len(), 1);
+        assert_eq!((log.preregs[0].suite.as_str(), log.preregs[0].time), (hex::encode(suite).as_str(), time));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

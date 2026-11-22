@@ -10,6 +10,11 @@
 //!
 //! The verifier checks the signature against the pinned notary key and compares
 //! the log with the eval report (`ph eval verify --notary-log`).
+//!
+//! The notary also time-stamps eval pre-registrations (`PH-PREREG`): it journals
+//! each one and returns a signed receipt. Every log lists all pre-registrations
+//! in the journal, so a verifier sees whether one suite was pre-registered more
+//! than once (seed shopping).
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +50,45 @@ pub enum SlotStatus {
     Aborted,
 }
 
+/// A pre-registration the notary recorded (journal `P` record).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreregRecord {
+    /// Hash (hex) of the suite it is for.
+    pub suite: String,
+    /// The pre-registration's hash (hex).
+    pub prereg: String,
+    /// Notary clock when it was recorded (unix seconds).
+    pub time: u64,
+}
+
+/// What the notary signs in a pre-registration receipt.
+pub fn prereg_receipt_digest(suite: &Digest, prereg: &Digest, time: u64) -> Digest {
+    let mut h = Hasher::new(domain::NOTARY_PREREG);
+    h.digest(suite).digest(prereg).u64(time);
+    h.finish()
+}
+
+fn verify_k256(pinned: &NotaryKey, digest: &Digest, signature: &[u8], what: &str) -> Result<(), String> {
+    use k256::ecdsa::signature::Verifier as _;
+    if pinned.alg != "k256" {
+        return Err(format!("{what}: the pinned notary key is not k256"));
+    }
+    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pinned.key).map_err(|_| "bad notary key".to_string())?;
+    let sig = k256::ecdsa::Signature::from_slice(signature).map_err(|_| format!("malformed {what} signature"))?;
+    vk.verify(digest, &sig).map_err(|_| format!("{what} signature does not verify"))
+}
+
+/// Check a pre-registration receipt against the pinned notary key.
+pub fn verify_prereg_receipt(
+    pinned: &NotaryKey,
+    suite: &Digest,
+    prereg: &Digest,
+    time: u64,
+    signature: &[u8],
+) -> Result<(), String> {
+    verify_k256(pinned, &prereg_receipt_digest(suite, prereg, time), signature, "pre-registration receipt")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLog {
     /// Notary public key (k256, compressed SEC1).
@@ -55,6 +99,8 @@ pub struct SessionLog {
     pub sessions: Vec<String>,
     /// Every slot of those sessions, sorted by slot text.
     pub slots: Vec<SlotHistory>,
+    /// Every pre-registration in the journal, in journal order.
+    pub preregs: Vec<PreregRecord>,
     /// ECDSA secp256k1 / SHA-256 signature over `digest()`.
     pub signature: Vec<u8>,
 }
@@ -70,21 +116,19 @@ impl SessionLog {
         for s in &self.slots {
             h.str(&s.slot).str(&s.events);
         }
+        h.u64(self.preregs.len() as u64);
+        for p in &self.preregs {
+            h.str(&p.suite).str(&p.prereg).u64(p.time);
+        }
         h.finish()
     }
 
     /// Check the signature against the pinned notary key and the log's shape.
     pub fn verify(&self, pinned: &NotaryKey) -> Result<(), String> {
-        use k256::ecdsa::signature::Verifier as _;
-        if pinned.alg != "k256" || pinned.key != self.notary_key {
+        if pinned.key != self.notary_key {
             return Err("session log is not from the pinned notary".into());
         }
-        let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&self.notary_key)
-            .map_err(|_| "bad notary key".to_string())?;
-        let sig = k256::ecdsa::Signature::from_slice(&self.signature)
-            .map_err(|_| "malformed session log signature".to_string())?;
-        vk.verify(&self.digest(), &sig)
-            .map_err(|_| "session log signature does not verify".to_string())?;
+        verify_k256(pinned, &self.digest(), &self.signature, "session log")?;
         let mut sorted = self.sessions.clone();
         sorted.sort();
         sorted.dedup();
@@ -194,6 +238,7 @@ mod tests {
                 .iter()
                 .map(|(s, e)| SlotHistory { slot: s.to_text(), events: e.to_string() })
                 .collect(),
+            preregs: vec![],
             signature: vec![],
         }
     }
