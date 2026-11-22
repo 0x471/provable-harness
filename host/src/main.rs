@@ -257,8 +257,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: EvalCmd,
     },
-    /// Print the verifying-key hash of the embedded harness program.
-    Vkey,
 }
 
 fn parse_session(s: Option<&str>) -> Result<Digest> {
@@ -802,7 +800,6 @@ fn main() -> Result<()> {
                 serde_json::from_str(&fs::read_to_string(RunDir(run).transcript())?)?;
             print_transcript(&t.messages);
         }
-        Cmd::Vkey => println!("{}", prover::vk_hash()?),
         Cmd::Eval { cmd } => match cmd {
             EvalCmd::Seed { prereg: None, .. } => println!("{}", eval_cmd::fresh_seed()?),
             EvalCmd::Seed { prereg: Some(p), out } => {
