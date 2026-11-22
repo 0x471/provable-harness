@@ -21,8 +21,9 @@ fuzz_target!(|data: &[u8]| {
         let after = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
         let path = after.split(['?', '#']).next().unwrap_or("");
         assert!(!path.split('/').skip(1).any(|seg| seg == "." || seg == ".."), "{url}");
-        for bad in ["%2e", "%2f", "%5c", "\\"] {
-            assert!(!lower.contains(bad), "{url}");
+        for bad in ["%2e", "%2f", "%5c"] {
+            assert!(!path.contains(bad), "{url}");
         }
+        assert!(!lower.contains('\\'), "{url}");
     }
 });

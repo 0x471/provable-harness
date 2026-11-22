@@ -537,6 +537,7 @@ fn url_allowlist_respects_path_boundaries() {
         format!("{REPORT_URL}s-export"),
         format!("{REPORT_URL}%2fx"),
         "https://api.weather.example/v1/./report".to_string(),
+        format!("{REPORT_URL}?a=\\\\b"),
     ];
     let code = bad
         .iter()
@@ -544,13 +545,15 @@ fn url_allowlist_respects_path_boundaries() {
         .collect::<Vec<_>>()
         .join("\n");
     let replies = vec![
-        script(&format!("{code}\nhttp_post(\"{REPORT_URL}?id=1\", \"ok\")")),
+        script(&format!(
+            "{code}\nhttp_post(\"{REPORT_URL}?id=1\", \"ok\");\nhttp_post(\"{REPORT_URL}?d=2026%2F11%2F22\", \"ok\")"
+        )),
         "done".into(),
     ];
     let (live, w) = live_run(&input(), replies);
     assert_eq!(verify_witness(&w).unwrap().claim, live.claim);
     assert_eq!(live.claim.calls_denied, bad.len() as u32);
-    assert_eq!(live.claim.external_calls, 1, "only the query-string variant is allowed");
+    assert_eq!(live.claim.external_calls, 2, "only the query-string variants are allowed");
 }
 
 #[test]

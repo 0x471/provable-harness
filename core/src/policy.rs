@@ -241,16 +241,21 @@ pub fn url_under_prefix(url: &str, prefix: &str) -> bool {
 
 /// Reject URLs whose path a real HTTP client would normalise differently from
 /// the string the policy matched: dot segments, encoded dots/slashes and
-/// backslashes (WHATWG parsers treat `\` as `/` and resolve `%2e%2e`).
+/// backslashes (WHATWG parsers treat `\` as `/` and resolve `%2e%2e`). Queries
+/// are not normalised, so encoded characters there are data (native tool
+/// inputs encode `/` in a query value as `%2F`).
 pub fn validate_request_url(url: &str) -> Result<(), String> {
     let lower = url.to_ascii_lowercase();
-    for bad in ["%2e", "%2f", "%5c", "\\"] {
-        if lower.contains(bad) {
-            return Err(format!("url contains {bad}"));
-        }
+    if lower.contains('\\') {
+        return Err("url contains \\".into());
     }
     let after_scheme = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
     let path = after_scheme.split(['?', '#']).next().unwrap_or("");
+    for bad in ["%2e", "%2f", "%5c"] {
+        if path.contains(bad) {
+            return Err(format!("url path contains {bad}"));
+        }
+    }
     if path.split('/').skip(1).any(|seg| seg == "." || seg == "..") {
         return Err("url path contains a dot segment".into());
     }
