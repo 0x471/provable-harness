@@ -1311,9 +1311,9 @@ mod string_functions {
 
         let p = string.make_mut();
 
-        for _ in 0..(len - orig_len) {
-            p.push(character);
-        }
+        // (provable-harness patch) Append the padding in one copy: a push per
+        // character costs ~75 zkVM cycles each.
+        p.push_str(&character.encode_utf8(&mut [0u8; 4]).repeat(len - orig_len));
 
         #[cfg(not(feature = "unchecked"))]
         if _ctx.engine().max_string_size() > 0 && string.len() > _ctx.engine().max_string_size() {
@@ -1373,7 +1373,7 @@ mod string_functions {
             .into());
         }
 
-        let mut str_len = string.chars().count();
+        let str_len = string.chars().count();
         let padding_len = padding.chars().count();
 
         // (provable-harness patch) An empty padding looped forever below.
@@ -1383,15 +1383,12 @@ mod string_functions {
 
         let p = string.make_mut();
 
-        while str_len < len {
-            if str_len + padding_len <= len {
-                p.push_str(padding);
-                str_len += padding_len;
-            } else {
-                p.extend(padding.chars().take(len - str_len));
-                str_len = len;
-            }
-        }
+        // (provable-harness patch) Whole copies of the padding in one append,
+        // then the partial one: a push per copy costs ~75 zkVM cycles per
+        // character for one-character paddings.
+        let missing = len - str_len;
+        p.push_str(&padding.repeat(missing / padding_len));
+        p.extend(padding.chars().take(missing % padding_len));
 
         #[cfg(not(feature = "unchecked"))]
         if _ctx.engine().max_string_size() > 0 && string.len() > _ctx.engine().max_string_size() {

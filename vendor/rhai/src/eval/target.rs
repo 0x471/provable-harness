@@ -365,11 +365,15 @@ impl<'a> Target<'a> {
 
                 let s = &mut *source.write_lock::<crate::ImmutableString>().unwrap();
 
-                *s = s
-                    .chars()
-                    .enumerate()
-                    .map(|(i, ch)| if i == *index { new_ch } else { ch })
-                    .collect();
+                // (provable-harness patch) Splice the character in with two
+                // copies instead of rebuilding the string one character at a time.
+                if let Some((at, old)) = s.char_indices().nth(*index) {
+                    let mut t = String::with_capacity(s.len() + 4);
+                    t.push_str(&s[..at]);
+                    t.push(new_ch);
+                    t.push_str(&s[at + old.len_utf8()..]);
+                    *s = t.into();
+                }
             }
             #[cfg(not(feature = "no_index"))]
             Self::StringSlice {
