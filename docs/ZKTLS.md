@@ -138,7 +138,7 @@ TLSNotary can redact ranges, and the obvious design redacts the `x-api-key` valu
 So the presentation discloses everything, the guest checks the key's charset (no CR/LF), and the **API key is inside the witness**. Consequences:
 - `witness.bin` and the presentations are secrets. Keep them as private as the API key itself.
 - The public claim does not contain the key. **But SP1 core/compressed STARK proofs should not be assumed zero-knowledge.** Before publishing a proof of a session that used a real key:
-  - wrap it with Groth16/PLONK (this needs gnark; not done here), or
+  - wrap it with Groth16 (`ph prove --mode groth16`, built with `--features groth16`; implemented, not yet run here), or
   - use a short-lived key and revoke it after the session.
 - Proving on a third-party prover network gives them the key.
 - A cleaner future option: redact the key and prove in ZK that the hidden bytes are `[A-Za-z0-9_-]`. TLSNotary has ZK-on-committed-data tooling; it is not integrated here.
@@ -171,7 +171,7 @@ So the presentation discloses everything, the guest checks the key's charset (no
   - Per step in the guest:
     - about 1.2M cycles with the mock's single RSA certificate;
     - about 19M cycles with Anthropic's real chain, because the intermediate is signed with P-384, verified in software.
-  - Caching an already-verified chain across the steps of a session would cut this. Not done.
+  - The verified-chain cache in the fork removes the repeat cost: the fully real session went from 102.0 M to 70.5 M cycles.
 - **Guest RNG.** The guest prints SP1's "insecure random number generator" warning. That RNG is a deterministic, fixed-seed `StdRng`, used only to seed `HashMap` hashing inside TLSNotary's verifier. All uses are keyed lookups or duplicate counts, so verification outcomes do not depend on it.
 
 ## 6. Measured (Apple M4 Pro, 24 GB, SP1 v6.10 CPU prover)
