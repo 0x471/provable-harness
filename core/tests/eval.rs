@@ -178,6 +178,10 @@ fn guest_entry_point_matches_and_roundtrips() {
     assert_eq!(GuestOutput::from_bytes(&out.to_bytes()).unwrap(), out);
 }
 
+/// What the eval proof itself rules out. Re-rolling a run (asking the model
+/// again for the same step) is the notary's to refuse; that is tested against
+/// a real notary in `zktls/tests/e2e.rs` (`notarize_verify_and_no_rerolls`,
+/// `aborting_after_peeking_burns_the_slot`). These tests use a signing gateway.
 #[test]
 fn no_cherry_picking() {
     let s = suite(true);

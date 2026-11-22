@@ -1,6 +1,8 @@
 //! Public-value forgery against a real eval proof: an operator edits the eval
-//! report inside a valid proof (better grades, another seed, a hidden run).
-//! Every edit must make SP1 verification fail.
+//! report inside a valid proof (better grades, another seed, a delivered run
+//! relabelled as missing). Every edit must make SP1 verification fail. Runs
+//! withheld before proving are a different matter: they are reported as
+//! missing by the proof itself (see `no_cherry_picking` in core/tests/eval.rs).
 //!
 //!   cargo run --release -p ph-host --example eval_forgery -- runs/eval-real/out
 
@@ -43,7 +45,7 @@ fn main() {
     let mut r = report.clone();
     r.runs[1].claim = None;
     r.totals.missing += 1;
-    forgeries.push(("hide a run as missing", r));
+    forgeries.push(("relabel a delivered run as missing", r));
     let mut r = report.clone();
     r.suite_name = "some-other-suite".into();
     forgeries.push(("rename the suite", r));
