@@ -47,7 +47,7 @@ Evidence that the fork is faithful:
 - **Same decisions as `ring` on these tests.** `webpki-algs/tests/differential.rs` compares the fork's accept/reject decision with ring's on:
   - random ECDSA and RSA vectors, tampered messages/signatures/keys, and encoding edge cases;
   - 9 live certificate chains, including tampered certificates and wrong host names.
-- **Reads upstream output.** A presentation produced by **upstream** TLSNotary against the real `api.anthropic.com` deserializes and verifies with the fork. Byte flips across it are rejected (`core/tests/zktls.rs`).
+- **Reads TLSNotary output.** Presentations made by the upstream prover and an upstream-based notary (the `zktls/` workspace) verify with the fork, and so did one of a real `api.anthropic.com` exchange during development. `core/tests/zktls.rs` keeps a presentation recorded against the mock API and rejects byte flips across it.
 
 In the guest, SHA-256, P-256, secp256k1 (notary key) and RSA are accelerated by SP1 precompile patches. P-384 is not, because SP1 has no precompile for it.
 
@@ -56,7 +56,7 @@ In the guest, SHA-256, P-256, secp256k1 (notary key) and RSA are accelerated by 
 1. The attestation is signed by the **pinned notary key** under the **pinned signature scheme**. TLSNotary's own verify only checks the signature against whatever key is embedded, so pinning is our responsibility.
    - Pinning the key alone is not enough. TLSNotary accepts both `secp256k1` and the Keccak-prehashed `secp256k1eth` for one k256 key. Also, *any* TLSNotary notary holding that key (e.g. a stock notary server, or a second process with its own slot journal) would sign without enforcing the one-reply-per-slot rule.
    - So the ph notary uses its own scheme: TLSNotary private-use signature id `0xA1`, ECDSA secp256k1/SHA-256 over `"provable-harness/notary-attestation/v1\0" || header`. The guest accepts only that scheme.
-   - Test `only_the_ph_notary_scheme_is_accepted`: the upstream-signed fixture, a `secp256k1eth` re-signature, another key, and the scheme without the domain are all rejected. The e2e tests show an upstream-tlsn notary with this signer verifies in the forked guest.
+   - Test `only_the_ph_notary_scheme_is_accepted`: `secp256k1` and `secp256k1eth` re-signatures of the fixture (valid under upstream rules), another key, and the scheme without the domain are all rejected. The e2e tests show an upstream-tlsn notary with this signer verifies in the forked guest.
    - Attestations carrying extensions are rejected (the notary's default config already refuses them).
 2. The **server identity proof** is present, names `host`, and its certificate chain is valid at the notarized time under the configured roots (`Mozilla` compiled into the guest, or a pinned list).
 3. The protocol is TLS 1.2, and the transcript is present and **complete**: not a single byte redacted, in either direction (see section 5.1).
