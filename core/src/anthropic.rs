@@ -353,12 +353,15 @@ pub fn parse_reply(body: &[u8], native: bool) -> Result<ApiReply, String> {
     })
 }
 
-/// The response model must be the requested one, or a dated snapshot of it.
+/// The response model must be the requested one, or a dated snapshot of it
+/// (`-YYYYMMDD`). Any other digit suffix is another model: `claude-haiku-5-5`
+/// is not a snapshot of `claude-haiku-5`.
 pub fn model_matches(requested: &str, served: &str) -> bool {
     served == requested
         || served
             .strip_prefix(requested)
-            .is_some_and(|rest| rest.starts_with('-') && rest[1..].bytes().all(|b| b.is_ascii_digit()) && rest.len() > 1)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|date| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -457,5 +460,7 @@ mod tests {
         assert!(!model_matches("claude-x", "claude-x-evil"));
         assert!(!model_matches("claude-x", "claude-x-"));
         assert!(!model_matches("claude-x", "claude-xl"));
+        assert!(!model_matches("claude-haiku-5", "claude-haiku-5-5"));
+        assert!(!model_matches("claude-x", "claude-x-2026100"));
     }
 }
