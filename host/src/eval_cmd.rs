@@ -125,6 +125,17 @@ pub fn run(
     for (case, repeat) in suite.runs() {
         let input = suite.session_input(&seed, case, repeat, &model_id, &model_auth);
         let label = format!("{} #{repeat}", suite.cases[case].name);
+        let dir = out.join(format!("run-{case:02}-{repeat:02}"));
+        // Each run's evidence is saved as soon as it exists: its notary slots
+        // are one-shot, so a crash later must not lose it. A rerun with the
+        // same --out picks it up instead of asking the notary again.
+        let saved = dir.join("evidence.bin");
+        if saved.exists() {
+            let ev = RunEvidence::from_bytes(&fs::read(&saved)?).map_err(|e| anyhow!("{}: {e}", saved.display()))?;
+            println!("  {label:<28} resumed from {}", saved.display());
+            runs.push(Some(ev));
+            continue;
+        }
         match crate::live::run_live(&input, "", Some(proxy), None) {
             Ok((output, witness)) => {
                 let c = &output.claim;
@@ -140,8 +151,14 @@ pub fn run(
                     g(e.utility),
                     g(e.attack_succeeded)
                 );
-                let dir = out.join(format!("run-{case:02}-{repeat:02}"));
                 fs::create_dir_all(&dir)?;
+                let ev = RunEvidence {
+                    blind: witness.blind,
+                    model_responses: witness.model_responses.clone(),
+                };
+                let tmp = dir.join("evidence.bin.tmp");
+                fs::write(&tmp, ev.to_bytes())?;
+                fs::rename(&tmp, &saved)?;
                 fs::write(
                     dir.join("transcript.json"),
                     serde_json::to_string_pretty(&crate::scenario::Transcript::new(&input, &output, &witness.blind))?,
@@ -151,10 +168,7 @@ pub fn run(
                     serde_json::to_string_pretty(&crate::scenario::FinalWorkspace::new(&output, &witness.blind))?,
                 )?;
                 crate::write_actions(&dir, &output, &witness.blind)?;
-                runs.push(Some(RunEvidence {
-                    blind: witness.blind,
-                    model_responses: witness.model_responses,
-                }));
+                runs.push(Some(ev));
             }
             Err(e) => {
                 // The slot is burned; the run is reported as missing, not retried.

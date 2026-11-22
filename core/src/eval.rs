@@ -593,6 +593,16 @@ pub struct RunEvidence {
     pub model_responses: Vec<ModelEvidence>,
 }
 
+impl RunEvidence {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("run evidence serialization cannot fail")
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, String> {
+        bincode::deserialize(b).map_err(|e| format!("malformed run evidence: {e}"))
+    }
+}
+
 /// The guest input of an eval: the suite, the verifier's seed, the pinned model,
 /// and evidence for each run in canonical order (`None` = not delivered).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
