@@ -127,6 +127,23 @@ sequenceDiagram
 
 The notary hands out one reply per (session, step), so the operator cannot re-sample the model until it likes the answer. Details and the attack analysis: [docs/ZKTLS.md](docs/ZKTLS.md).
 
+## What the SP1 proof checks
+
+The guest gets two kinds of input:
+
+- **Public configuration**, which the verifier has too: system prompt, task, policy, initial workspace, tool definitions, the trusted keys or the notary and its root certificates, and the session id.
+- **The private witness**: only responses (model replies, tool results) and their signatures or TLS presentations. It never contains requests. The guest builds every request itself.
+
+Then it runs the session again and checks:
+
+- **For every model step**: it rebuilds the request from the session state (a hash chain over the system prompt, the tools and every message so far). In default mode, the gateway's Ed25519 signature must cover that request hash and the reply. In zkTLS mode, the TLS exchange must contain exactly that request (see docs/ZKTLS.md).
+- **For every tool call**: the policy decision with the call's actual arguments (allowed paths and URLs, budgets, the no-egress-after-secrets rule). File tools run inside the proof on the committed workspace. A network call needs the oracle's signature over the exact call and its result, or a zkTLS presentation of exactly that request, or, in evals, an answer from the published fixture world.
+- **Throughout**: call and operation budgets, whether secret data was read, the transcript and action-log hash chains, and that the witness is consumed in order, with nothing missing or left over.
+
+At the end it commits the claim as its public output. Any failed check makes the guest panic, and a panicking guest has no proof.
+
+`ph verify` then does two things. SP1 checks the proof against the pinned vk, which identifies the exact harness program. Then the claim is compared with what the verifier expects: the hashes of its policy, prompt, task, workspace, tool definitions and trusted keys, its session id, and optionally the disclosed transcript and action log, which must hash to the values in the claim.
+
 ## Quick start
 
 You need:
