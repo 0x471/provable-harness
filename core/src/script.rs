@@ -373,6 +373,12 @@ const CASE_WEIGHT: u64 = 32;
 /// Meter units per match of `replace`: each costs a search restart and a copy.
 const MATCH_WEIGHT: u64 = 16;
 
+/// Meter units per Rhai operation. One operation costs up to ~4.6 K zkVM cycles
+/// (comparing array elements in `in` or `==` calls back into Rhai). Charging
+/// operations to the data meter too makes one budget bound both kinds of work:
+/// with two separate budgets a script could spend both in full.
+const OP_WEIGHT: u64 = 256;
+
 fn data_too_large() -> Box<EvalAltResult> {
     EvalAltResult::ErrorDataTooLarge("Length of string".into(), Position::NONE).into()
 }
@@ -650,6 +656,7 @@ pub(crate) fn build_engine(env: &Rc<RefCell<ToolEnv>>, policy: &Policy) -> Engin
         // native function swallows the error, the next operation stops again.
         let n = ops.current.get() + 1;
         ops.current.set(n);
+        ops.charge(OP_WEIGHT);
         if n > ops.script_cap {
             ops.script_exhausted.set(true);
         }
