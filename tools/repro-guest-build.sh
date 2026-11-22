@@ -14,6 +14,16 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 BASE=${PH_REPRO_DIR:-/tmp/ph-repro}
 mkdir -p "$BASE"
 BASE=$(cd "$BASE" && pwd -P)
+# /tmp is shared: a directory another user created, or can write to, could hold
+# planted sources or crates that this build would compile into the guest.
+PERM=$(ls -ld "$BASE" | cut -c1-10)
+case "$PERM" in
+?????w????|????????w?) echo "refusing $BASE: writable by group or others" >&2; exit 1 ;;
+esac
+if [ ! -O "$BASE" ]; then
+    echo "refusing $BASE: owned by another user" >&2
+    exit 1
+fi
 SRC="$BASE/src"
 mkdir -p "$SRC"
 for d in program core vendor/rhai vendor/smartstring vendor/tlsn webpki-algs; do
