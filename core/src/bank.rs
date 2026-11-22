@@ -1,8 +1,10 @@
 //! A stateful simulated bank for fixture worlds, answered inside the proof.
 //!
-//! It reproduces the banking tools of AgentDojo (ETH Zurich, MIT licence,
-//! `default_suites/v1/tools/banking_client.py` and `user_account.py` at commit
-//! 089ed468) over an HTTP-shaped API, so post-run state checks can follow
+//! It reproduces the banking tools of AgentDojo (`default_suites/v1/tools/
+//! banking_client.py` and `user_account.py` at commit 089ed468; MIT License,
+//! Copyright (c) 2024 Edoardo Debenedetti, Jie Zhang, Mislav Balunovic, Luca
+//! Beurer-Kellner, Marc Fischer, and Florian Tramer; full text in
+//! tools/agentdojo/AGENTDOJO_LICENSE) over an HTTP-shaped API, so post-run state checks can follow
 //! AgentDojo's own utility and security functions exactly:
 //!
 //! - `send_money` appends a transaction and does not change the balance;
