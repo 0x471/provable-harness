@@ -179,6 +179,20 @@ impl Scenario {
 
 // ---- keys -----------------------------------------------------------------
 
+/// Create a file readable by its owner only.
+pub fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(data)?;
+    Ok(())
+}
+
 pub fn keygen(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir)?;
     for name in ["gateway", "oracle"] {
@@ -189,7 +203,7 @@ pub fn keygen(dir: &Path) -> Result<()> {
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed)?;
         let sk = SigningKey::from_bytes(&seed);
-        fs::write(&sk_path, to_hex(&seed))?;
+        write_secret(&sk_path, to_hex(&seed).as_bytes())?;
         fs::write(
             dir.join(format!("{name}.pub")),
             to_hex(sk.verifying_key().as_bytes()),
