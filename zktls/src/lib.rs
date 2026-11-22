@@ -360,7 +360,9 @@ impl NotaryState {
 }
 
 const INTENT_PREFIX: &[u8] = b"PH-INTENT ";
-const INTENT_MAX: usize = 128;
+/// Longest opening line (`PH-AUTH`, `PH-INTENT` or `PH-PREREG`, which holds two
+/// hashes).
+const LINE_MAX: usize = 256;
 
 fn intent_line(slot: &Slot) -> Vec<u8> {
     format!("PH-INTENT {}\n", slot.to_text()).into_bytes()
@@ -381,7 +383,7 @@ async fn read_line<S: AsyncRead + Unpin>(socket: &mut S) -> Result<Vec<u8>> {
             return Ok(line);
         }
         line.push(b);
-        if line.len() > INTENT_MAX {
+        if line.len() > LINE_MAX {
             bail!("opening line too long");
         }
     }
@@ -1374,7 +1376,7 @@ mod tests {
     fn intent_roundtrip() {
         for slot in [Slot::model(&[0x0f; 32], 7), Slot::tool(&[0x0f; 32], u64::MAX)] {
             let line = intent_line(&slot);
-            assert!(line.len() <= super::INTENT_MAX + 1);
+            assert!(line.len() <= super::LINE_MAX + 1);
             assert_eq!(parse_intent(&line[..line.len() - 1]), Some(slot));
         }
         let hex = "0f".repeat(32);

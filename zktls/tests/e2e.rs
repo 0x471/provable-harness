@@ -634,3 +634,27 @@ fn notary_requires_operator_token_and_logs_sessions() {
     let _ = std::fs::remove_file(&tokens);
     let _ = std::fs::remove_file(&journal);
 }
+
+/// A pre-registration time-stamp over a real connection to the notary: the
+/// opening line fits, the receipt verifies with ph-core's check, and a
+/// malformed line is refused.
+#[test]
+fn prereg_receipt_over_a_connection() {
+    use std::io::{BufRead, Write};
+    let s = stack(vec![]);
+    let (suite, prereg) = ([0x11u8; 32], [0x22u8; 32]);
+    let ask = |line: String| -> String {
+        let mut c = std::net::TcpStream::connect(&s.notary).unwrap();
+        c.write_all(line.as_bytes()).unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(&c).read_line(&mut reply).unwrap();
+        reply
+    };
+    let r = ask(format!("PH-PREREG {} {}\n", hex::encode(suite), hex::encode(prereg)));
+    let mut it = r.trim_end().split(' ');
+    assert_eq!(it.next(), Some("OK"), "{r}");
+    let time: u64 = it.next().unwrap().parse().unwrap();
+    let sig = hex::decode(it.next().unwrap()).unwrap();
+    ph_core::notary_log::verify_prereg_receipt(&s.config.notary, &suite, &prereg, time, &sig).unwrap();
+    assert!(ask(format!("PH-PREREG {} x\n", hex::encode(suite))).starts_with("REFUSED"));
+}
