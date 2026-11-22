@@ -549,6 +549,14 @@ fn cmd_verify(run: &Path, scenario: &Scenario, keys: &Path, x: &Expect<'_>) -> R
             ok: allow_incomplete || claim.outcome == Outcome::Completed,
             detail: format!("{:?}", claim.outcome),
         },
+        Check {
+            name: "no eval grade",
+            ok: claim.eval.is_none(),
+            detail: match claim.eval {
+                None => "single session".into(),
+                Some(_) => "the claim carries a grade from a grader nobody pinned; use ph eval verify".into(),
+            },
+        },
     ];
     if let Some(s) = session {
         let want = from_hex32(s).ok_or_else(|| anyhow!("--session must be 32 hex bytes"))?;

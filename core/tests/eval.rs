@@ -225,14 +225,25 @@ fn verify_and_keep(b: EvalBatch) -> EvalBatch {
 fn fixture_results_come_from_the_committed_world() {
     let s = suite(true);
     let b = live_batch(&s, [5; 32]);
-    // Changing the world changes the suite hash, and the recorded replies no
-    // longer match the context the guest rebuilds (it now sees another page).
+    // The guest answers tool calls from the committed world: the agent acts on
+    // the injection only in the runs whose page carries it.
+    let r = verify_eval(&b).unwrap();
+    let attempted: Vec<bool> = r
+        .runs
+        .iter()
+        .map(|x| x.claim.as_ref().unwrap().eval.as_ref().unwrap().canary_attempts > 0)
+        .collect();
+    assert_eq!(attempted, [false, false, true, true]);
+    // The world is part of the suite and so of every session id: a batch
+    // recorded under one world fails at its first reply under another.
     let mut changed = b.clone();
     changed.suite.cases[1].world = world("{\"temp_c\":30}");
     assert_ne!(changed.suite.hash(), b.suite.hash());
-    assert!(verify_eval(&changed).is_err());
-    // A single session with fixture tools must not carry tool evidence.
-    let input = s.session_input(&[5; 32], 0, 0, "scripted/test", &auth());
+    let err = verify_eval(&changed).unwrap_err().to_string();
+    assert!(err.contains("model response for step 0"), "{err}");
+    // Fixture tools take no tool evidence: a witness that carries some fails.
+    let mut input = s.session_input(&[5; 32], 0, 0, "scripted/test", &auth());
+    input.eval = None;
     let w = ph_core::Witness {
         version: ph_core::FORMAT_VERSION,
         blind: BLIND,

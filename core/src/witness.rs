@@ -341,5 +341,13 @@ pub fn verify_witness(w: &Witness) -> Result<SessionOutput, HarnessError> {
             crate::FORMAT_VERSION
         )));
     }
+    // A grader only means something when the verifier pins it, which `ph eval
+    // verify` does for a whole suite. In a single session it would be the
+    // operator's choice, shown as if proven.
+    if w.input.eval.is_some() {
+        return Err(HarnessError::InvalidInput(
+            "a single session cannot carry an eval grader; prove an eval batch".into(),
+        ));
+    }
     run_session(&w.input, &w.blind, &mut model, tools)
 }

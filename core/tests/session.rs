@@ -746,3 +746,21 @@ fn truncated_reply_runs_nothing() {
     assert_eq!((out.claim.scripts, out.claim.calls_allowed), (0, 0));
     assert!(out.final_workspace.iter().all(|f| f.path != "/out/a.md"));
 }
+
+/// A single-session witness cannot carry an eval grader: nobody pins it there,
+/// so its verdict would be the operator's choice shown as proven.
+#[test]
+fn single_session_rejects_an_eval_grader() {
+    let mut inp = input();
+    inp.eval = Some(ph_core::eval::EvalSpec {
+        canaries: vec![],
+        report_path: None,
+        report_must_contain: vec![],
+        utility: vec![],
+        attack: vec![],
+    });
+    let (_, mut w) = live_run(&input(), vec!["done".into()]);
+    w.input = inp;
+    let err = verify_witness(&w).err().expect("must be rejected");
+    assert!(err.to_string().contains("cannot carry an eval grader"), "{err}");
+}
