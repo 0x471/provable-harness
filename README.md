@@ -52,9 +52,51 @@ The reader still has to trust that the notary did not collude with the evaluator
 
 The harness core, `ph-core`, does no I/O of its own. Model and tool access go through two small interfaces, so the same code can run twice: once live, once inside the zkVM.
 
+```mermaid
+flowchart LR
+    subgraph live["1. Live run (operator)"]
+        H["ph-core harness"]
+        M["model API"]
+        T["tools and websites"]
+        H -->|requests| M
+        M -->|"signed or notarized replies"| H
+        H -->|"tool calls"| T
+        T -->|"signed or notarized results"| H
+    end
+    H -->|"responses + attestations"| W[("witness<br/>(private)")]
+    subgraph zk["2. Replay in the SP1 zkVM"]
+        G["same ph-core code:<br/>rebuilds every request,<br/>checks every attestation,<br/>re-runs policy and file tools"]
+    end
+    W --> G
+    G --> P["proof + public claim"]
+    P --> V["3. ph verify"]
+```
+
 1. **Live run.** `ph` runs the agent against the real model and tools and records every response together with its signature or TLSNotary presentation. That recording is the witness, and it stays private.
 2. **Replay.** The SP1 guest runs the same `ph-core` over the witness. It never trusts a request from the witness: it rebuilds each one from its own state and checks the attestation against it. It then re-runs the policy checks and file tools and commits a claim as public output. If anything does not match, the guest stops and no proof can exist.
 3. **Verify.** `ph verify` checks the proof against the program's vk and against what the verifier expects: policy, system prompt, task, workspace, the trusted keys or notary, and the session id the verifier handed out (a fresh one per run, so the operator cannot pick the best of many runs).
+
+One step of the agent loop:
+
+```mermaid
+sequenceDiagram
+    participant H as harness (ph-core)
+    participant M as model
+    participant P as policy
+    participant T as tool backend
+    H->>M: context so far (hash-chained)
+    M-->>H: reply: a Rhai script or native tool calls
+    loop every tool call
+        H->>P: tool + runtime arguments
+        alt allowed
+            H->>T: run it (files inside the proof, http through the backend)
+            T-->>H: result, signed or notarized
+        else denied
+            P-->>H: denied, recorded in the action log
+        end
+    end
+    H->>M: results become the next turn
+```
 
 The model works either in code mode (it writes a small [Rhai](https://rhai.rs) script that calls the tools) or with native tool calls. Each call goes through the policy with its actual arguments. A policy can, for example, block all network egress as soon as secret data has been read. The script engine is metered, so an injected script cannot make proving explode: under the default budgets the worst case is about 160 M zkVM cycles per session.
 
@@ -66,7 +108,22 @@ The model works either in code mode (it writes a small [Rhai](https://rhai.rs) s
 | Tool results (`http_get`, `http_post`) | signed by a tool oracle you trust | notarized HTTPS exchange with the website | answered inside the proof from the published fixture world |
 | Files | committed workspace, checked in the proof | same | same |
 
-In zkTLS mode, trust moves from those two services to a TLSNotary notary that does not collude with the operator, plus the web PKI.
+In zkTLS mode, trust moves from those two services to a TLSNotary notary that does not collude with the operator, plus the web PKI. The operator runs a prover proxy that talks to the real API over MPC-TLS together with the notary:
+
+```mermaid
+sequenceDiagram
+    participant H as ph (harness)
+    participant X as ph-zktls proxy (operator)
+    participant N as notary
+    participant A as api.anthropic.com
+    H->>X: exact request body
+    X->>N: announce session and step (the notary consumes that slot)
+    X->>A: TLS 1.2, session keys shared with the notary (MPC-TLS)
+    A-->>X: response
+    N-->>X: signed attestation, bound to the slot
+    X-->>H: presentation of the full exchange
+    Note over H: stored in the witness. The guest checks the certificate chain, the handshake, the notary signature, the slot and the exact request bytes.
+```
 
 The notary hands out one reply per (session, step), so the operator cannot re-sample the model until it likes the answer. Details and the attack analysis: [docs/ZKTLS.md](docs/ZKTLS.md).
 
@@ -142,6 +199,17 @@ For the real API and real websites, the notary should be a separate party runnin
 ## Provable evals
 
 A whole eval suite fits in one proof. Grading runs inside the proof, and runs the operator did not deliver show up as missing.
+
+```mermaid
+flowchart LR
+    S["seed<br/>(from the verifier, or from a<br/>pre-registered drand round)"] --> R["session ids<br/>H(suite, seed, case, repeat)"]
+    R --> L["every case x repeat runs live,<br/>model calls over zkTLS"]
+    L --> B[("eval batch<br/>(private)")]
+    B --> G["SP1 guest:<br/>replay and grade every run"]
+    G --> REP["one proof + report<br/>(grades, missing runs)"]
+    REP --> V["ph eval verify"]
+    NL["notary session log"] -.-> V
+```
 
 - The seed fixes which runs exist, so the operator cannot swap in runs of its own choosing, and any run left out is reported as missing. Without an interactive verifier, `ph eval prereg` commits to the suite, model, notary and program before a future drand round, and the seed comes from that round's randomness.
 - Tools answer from the suite's published fixture world, so the injected content is part of what the proof shows.
