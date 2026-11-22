@@ -156,7 +156,7 @@ So the presentation discloses everything, the guest checks the key's charset (no
 | No revocation checking | A revoked but unexpired certificate is accepted. Use pinned roots (`TlsRoots::Custom` with GTS roots) and a short `--tls-max-age-secs`. |
 | The verifier's anchors (notary key, roots) are its own | If the operator supplies `zktls.json`, it can name its own notary or CA and forge everything. `ph verify` prints the anchors and warns on custom roots. |
 | The proxy holds the API key and has no login | Anything that can reach `127.0.0.1:7050` can spend the key. Requests carrying an `Origin` header, or without `Content-Type: application/json`, get 403, so a web page cannot use the proxy (browsers attach `Origin` to cross-site POSTs, and need a CORS preflight to send JSON). Local processes are not stopped: keep the proxy on localhost, run it only while needed, and use a short-lived, spend-limited key. |
-| Intents are unauthenticated | Anyone who can reach the notary and knows a challenge can burn its slots (griefing). There are no timeouts or rate limits. |
+| Who may request slots | With `--operator-tokens`, only operators holding a token can open a session; openings time out after 10 s and MPC sessions after 180 s, and at most `--max-sessions` run at once. Without tokens, anyone who can reach the notary and knows a challenge can burn its slots (griefing). |
 | SP1 and the guest code | As in DESIGN.md. |
 
 ### 5.3 Other limits
