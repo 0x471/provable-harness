@@ -111,9 +111,20 @@ enum EvalCmd {
         #[arg(long)]
         tls_max_age_secs: Option<u64>,
         /// The notary's signed log for this eval's sessions (`ph-zktls session-log`).
-        /// Shows whether missing runs were never started, aborted, or withheld.
+        /// Shows whether missing runs were never started or started and not
+        /// delivered, and every pre-registration the notary saw.
         #[arg(long)]
         notary_log: Option<PathBuf>,
+        /// Require the notary log to be generated at or after this unix time
+        /// (a log made before a run cannot show it).
+        #[arg(long, requires = "notary_log")]
+        log_not_before: Option<u64>,
+        /// Missing runs to accept before failing.
+        #[arg(long, default_value_t = 0)]
+        allow_missing: usize,
+        /// Also check each delivered run's disclosed transcript.json.
+        #[arg(long)]
+        check_transcripts: bool,
     },
 }
 
@@ -860,6 +871,9 @@ fn main() -> Result<()> {
                 zktls_config,
                 tls_max_age_secs,
                 notary_log,
+                log_not_before,
+                allow_missing,
+                check_transcripts,
             } => {
                 let seed = match (seed, prereg, beacon) {
                     (Some(s), _, _) => eval_cmd::SeedSource::Given(s),
@@ -874,8 +888,13 @@ fn main() -> Result<()> {
                     &seed,
                     &dir,
                     &load_zktls_config(&zktls_config)?,
-                    tls_max_age_secs,
-                    notary_log.as_deref(),
+                    &eval_cmd::VerifyOptions {
+                        tls_max_age_secs,
+                        notary_log: notary_log.as_deref(),
+                        log_not_before,
+                        allow_missing,
+                        check_transcripts,
+                    },
                 )?;
             }
         },

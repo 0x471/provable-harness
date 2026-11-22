@@ -228,13 +228,26 @@ pub enum SeedSource {
     Beacon { prereg: crate::beacon::Prereg, beacon: crate::beacon::Beacon },
 }
 
+/// What `verify` checks besides the suite, the seed and the pinned config.
+#[derive(Default)]
+pub struct VerifyOptions<'a> {
+    pub tls_max_age_secs: Option<u64>,
+    pub notary_log: Option<&'a Path>,
+    /// The notary log must have been generated at or after this time (unix
+    /// seconds): a log made before a run cannot show it.
+    pub log_not_before: Option<u64>,
+    /// How many missing runs to accept before failing.
+    pub allow_missing: usize,
+    /// Check each delivered run's disclosed transcript.json against its claim.
+    pub check_transcripts: bool,
+}
+
 pub fn verify(
     suite_dir: &Path,
     seed_source: &SeedSource,
     dir: &Path,
     config: &ZkTlsConfig,
-    tls_max_age_secs: Option<u64>,
-    notary_log: Option<&Path>,
+    opts: &VerifyOptions,
 ) -> Result<EvalReport> {
     let suite = load_suite(suite_dir)?;
     let seed = match seed_source {
@@ -247,6 +260,23 @@ pub fn verify(
     println!("SP1 proof valid for harness program vk {vk}");
     let GuestOutput::Eval(report) = out else { bail!("proof is for a single session, not an eval") };
 
+    let mut warnings: Vec<String> = vec![];
+    println!("  notary key     {} {}", config.notary.alg, to_hex(&config.notary.key));
+    println!("  model API      {} (model {}, max_tokens {})", config.host, config.model, config.max_tokens);
+    match &config.roots {
+        ph_core::TlsRoots::Mozilla => println!("  TLS roots      Mozilla root store (compiled into the program)"),
+        ph_core::TlsRoots::Custom(roots) => {
+            use sha2::Digest as _;
+            for r in roots {
+                println!("  TLS root       sha256 {}", to_hex(&sha2::Sha256::digest(r)));
+            }
+            warnings.push(format!(
+                "custom TLS roots: whoever picked them can impersonate {}; a mock model or test setup uses these",
+                config.host
+            ));
+        }
+    }
+
     let model_auth = ModelAuth::ZkTls(config.clone());
     let mut fails = vec![];
     let mut check = |ok: bool, what: String| {
@@ -257,7 +287,11 @@ pub fn verify(
     };
     check(report.version == EVAL_REPORT_VERSION, format!("report version {}", report.version));
     check(report.suite_hash == suite.hash(), format!("suite {} hash {}", suite.name, to_hex(&suite.hash())));
-    check(report.seed == seed, format!("seed (the verifier's challenge) {}", to_hex(&seed)));
+    let seed_from = match seed_source {
+        SeedSource::Given(_) => "the verifier's challenge",
+        SeedSource::Beacon { .. } => "the pre-registered drand round",
+    };
+    check(report.seed == seed, format!("seed ({seed_from}) {}", to_hex(&seed)));
     check(report.model_auth_hash == model_auth.hash(), format!("zkTLS config pinned (notary {}, model {})", to_hex(&config.notary.key), config.model));
     check(report.model_id == config.model, format!("model id {}", report.model_id));
     let plan = suite.runs();
@@ -273,21 +307,37 @@ pub fn verify(
         .collect();
     if let (Some(lo), Some(hi)) = (times.iter().map(|t| t.0).min(), times.iter().map(|t| t.1).max()) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let fresh = tls_max_age_secs.is_none_or(|m| now.saturating_sub(lo) <= m) && hi <= now + 300;
+        let fresh = opts.tls_max_age_secs.is_none_or(|m| now.saturating_sub(lo) <= m) && hi <= now + 300;
         check(fresh, format!("notarized times {lo}..={hi} (now {now})"));
     }
     if let SeedSource::Beacon { prereg, beacon } = seed_source {
         println!("  seed from drand quicknet round {} (BLS signature verified), pre-registration {}", beacon.round, to_hex(&prereg.hash()));
-        check(prereg.suite_hash == to_hex(&suite.hash()), "pre-registered suite".into());
+        check(prereg.suite_hash == to_hex(&suite.hash()) && prereg.suite_name == suite.name, "pre-registered suite".into());
         check(prereg.model_auth_hash == to_hex(&model_auth.hash()) && prereg.model_id == report.model_id, "pre-registered model and notary".into());
         check(prereg.program_vk == vk, format!("pre-registered program vk {}", prereg.program_vk));
+        match &prereg.receipt {
+            None => check(false, "pre-registration time-stamped by the notary (it has no receipt, so it may have been written after its round)".into()),
+            Some(r) => {
+                let valid = r.verify(prereg, &config.notary);
+                check(
+                    valid.is_ok() && r.time < prereg.beacon_time,
+                    format!(
+                        "pre-registration time-stamped by the notary at {}, before its round at {}{}",
+                        r.time,
+                        prereg.beacon_time,
+                        valid.err().map(|e| format!(": {e:#}")).unwrap_or_default()
+                    ),
+                );
+            }
+        }
         let first = times.iter().map(|t| t.0).min();
         check(
             first.is_some_and(|t| t >= prereg.beacon_time),
             format!("every run notarized after the beacon round (round at {}, first run at {:?})", prereg.beacon_time, first),
         );
     }
-    if let Some(path) = notary_log {
+    let missing = report.runs.iter().filter(|r| r.claim.is_none()).count();
+    if let Some(path) = opts.notary_log {
         let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let log: ph_core::notary_log::SessionLog = serde_json::from_str(&text)?;
         let sig = log.verify(&config.notary);
@@ -296,8 +346,23 @@ pub fn verify(
         check(all.iter().all(|s| log.sessions.contains(s)), format!("log covers all {} sessions of this eval", all.len()));
         let last = times.iter().map(|t| t.1).max().unwrap_or(0);
         check(log.generated_at >= last, format!("log generated at {} (after the last notarized time {last})", log.generated_at));
+        match opts.log_not_before {
+            Some(t) => check(log.generated_at >= t, format!("log generated at or after {t}")),
+            None => warnings.push(format!(
+                "the log was generated at {}; a run started after that is not in it (ask the notary for a fresh log, then use --log-not-before)",
+                log.generated_at
+            )),
+        }
+        if let SeedSource::Beacon { prereg, .. } = seed_source {
+            let suite_hex = to_hex(&suite.hash());
+            let same: Vec<_> = log.preregs.iter().filter(|p| p.suite == suite_hex).collect();
+            check(
+                same.len() == 1 && same[0].prereg == to_hex(&prereg.hash()),
+                format!("the notary saw this one pre-registration of the suite (it saw {})", same.len()),
+            );
+        }
         let names = |r: &ph_core::eval::RunReport| format!("{}#{}", suite.cases[r.case as usize].name, r.repeat);
-        let (mut never, mut aborted, mut withheld) = (vec![], vec![], vec![]);
+        let (mut never, mut started) = (vec![], vec![]);
         let mut inconsistent = vec![];
         for r in &report.runs {
             use ph_core::notary_log::{reconcile, RunVerdict};
@@ -305,25 +370,48 @@ pub fn verify(
                 RunVerdict::Consistent => {}
                 RunVerdict::Inconsistent(why) => inconsistent.push(format!("{}: {why}", names(r))),
                 RunVerdict::NeverStarted => never.push(names(r)),
-                RunVerdict::Aborted { slot } => aborted.push(format!("{} (during {})", names(r), short_slot(&slot))),
-                RunVerdict::Withheld { signed } => withheld.push(format!("{} ({signed} signed model replies)", names(r))),
+                RunVerdict::Started { signed, unsigned } => started.push(format!(
+                    "{} ({signed} signed model replies{})",
+                    names(r),
+                    unsigned.map(|s| format!(", stopped during {}", short_slot(&s))).unwrap_or_default()
+                )),
             }
         }
         check(inconsistent.is_empty(), format!("delivered runs match the notary log{}", if inconsistent.is_empty() { String::new() } else { format!(": {}", inconsistent.join("; ")) }));
-        let missing = report.runs.iter().filter(|r| r.claim.is_none()).count();
-        println!("  missing runs per the notary log: {missing} total, {} never started, {} aborted, {} WITHHELD", never.len(), aborted.len(), withheld.len());
-        for (label, v) in [("never started", &never), ("aborted", &aborted), ("WITHHELD (completed, not delivered)", &withheld)] {
+        println!("  missing runs per the notary log: {missing} total, {} never started, {} STARTED AND NOT DELIVERED", never.len(), started.len());
+        for (label, v) in [("never started", &never), ("STARTED AND NOT DELIVERED", &started)] {
             for x in v.iter() {
                 println!("    {label}: {x}");
             }
         }
+    } else if missing > 0 {
+        warnings.push(format!("{missing} runs missing and no --notary-log: why they are missing is not shown"));
+    }
+    check(
+        missing <= opts.allow_missing,
+        format!("{missing} runs missing (accepted: {}, see --allow-missing)", opts.allow_missing),
+    );
+    if opts.check_transcripts {
+        for r in report.runs.iter() {
+            let Some(c) = &r.claim else { continue };
+            let p = dir.join(format!("run-{:02}-{:02}", r.case, r.repeat)).join("transcript.json");
+            let t: crate::scenario::Transcript = serde_json::from_str(
+                &fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?,
+            )?;
+            for (name, ok, _) in t.check(c)? {
+                check(ok, format!("{name} of {}#{}", suite.cases[r.case as usize].name, r.repeat));
+            }
+        }
     }
     print_report_named(&report, Some(&vk), Some(&suite));
+    for w in &warnings {
+        println!("  WARNING: {w}");
+    }
     if !fails.is_empty() {
         bail!("eval verification FAILED: {}", fails.join("; "));
     }
     println!(
-        "VERIFIED: every delivered run of suite {} ran under the published configuration for seed {}, with genuine model replies; grades were computed in the proof.",
+        "VERIFIED: every delivered run of suite {} ran under the published configuration for seed {}, with model replies notarized by the pinned notary; grades were computed in the proof.",
         suite.name,
         to_hex(&seed)
     );

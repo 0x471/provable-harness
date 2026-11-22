@@ -166,12 +166,13 @@ pub enum RunVerdict {
     Inconsistent(String),
     /// Not delivered; the notary never handed out a slot for it.
     NeverStarted,
-    /// Not delivered, although the notary signed every slot it handed out: the
-    /// operator held real model replies for `signed` steps and withheld the run.
-    Withheld { signed: u32 },
-    /// Not delivered; the operator stopped during `slot` (after the notary
-    /// consumed it, possibly after seeing the reply).
-    Aborted { slot: String },
+    /// Not delivered, although the operator started it: the notary signed
+    /// `signed` model replies, and `unsigned` names a slot it handed out but
+    /// never signed (the operator stopped during it, possibly after seeing the
+    /// reply). Both are the operator's choice, so they are reported together:
+    /// one extra announcement after a finished run would otherwise turn a
+    /// withheld run into an "aborted" one.
+    Started { signed: u32, unsigned: Option<String> },
 }
 
 /// Compare one run with the log. `delivered_steps` is the proven claim's step
@@ -186,9 +187,6 @@ pub fn reconcile(
     use crate::zktls::SlotKind;
     let slots: Vec<(Slot, &SlotHistory)> = log.session_slots(session_hex).collect();
     let Some(steps) = delivered_steps else {
-        if let Some((_, h)) = slots.iter().find(|(_, h)| h.status() == SlotStatus::Aborted) {
-            return RunVerdict::Aborted { slot: h.slot.clone() };
-        }
         if slots.is_empty() {
             return RunVerdict::NeverStarted;
         }
@@ -196,7 +194,11 @@ pub fn reconcile(
             .iter()
             .filter(|(s, h)| s.kind == SlotKind::Model && h.status() == SlotStatus::Signed)
             .count() as u32;
-        return RunVerdict::Withheld { signed };
+        let unsigned = slots
+            .iter()
+            .find(|(_, h)| h.status() == SlotStatus::Aborted)
+            .map(|(_, h)| h.slot.clone());
+        return RunVerdict::Started { signed, unsigned };
     };
     let mut model: Vec<(u64, SlotStatus)> = vec![];
     for (s, h) in &slots {
@@ -266,11 +268,12 @@ mod tests {
         let t = l(&[(Slot::model(&a, 0), "CD"), (Slot::tool(&a, 0), "C")]);
         assert!(matches!(reconcile(&t, &ha, Some(1), true), RunVerdict::Inconsistent(_)));
         assert_eq!(reconcile(&l(&[]), &ha, None, false), RunVerdict::NeverStarted);
-        assert_eq!(reconcile(&ok, &ha, None, false), RunVerdict::Withheld { signed: 2 });
-        let ab = l(&[(Slot::model(&a, 0), "CD"), (Slot::model(&a, 1), "C")]);
+        assert_eq!(reconcile(&ok, &ha, None, false), RunVerdict::Started { signed: 2, unsigned: None });
+        // A finished run plus one more announcement still shows its signed replies.
+        let ab = l(&[(Slot::model(&a, 0), "CD"), (Slot::model(&a, 1), "CD"), (Slot::model(&a, 2), "C")]);
         assert_eq!(
             reconcile(&ab, &ha, None, false),
-            RunVerdict::Aborted { slot: Slot::model(&a, 1).to_text() }
+            RunVerdict::Started { signed: 2, unsigned: Some(Slot::model(&a, 2).to_text()) }
         );
         // Other sessions' slots never count.
         assert_eq!(reconcile(&ok, &to_hex(&[3u8; 32]), None, false), RunVerdict::NeverStarted);
