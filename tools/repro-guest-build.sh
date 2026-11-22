@@ -8,10 +8,15 @@
 # then builds with sp1-build 6.10.0's exact flags. Same commit + same SP1
 # toolchain build (same OS) => same ELF, whoever and wherever builds it.
 #
-# Usage: tools/repro-guest-build.sh            (prints elf_sha256 and the ELF path)
+# The directory is part of the flags, so only /tmp/ph-repro gives the published
+# vk. PH_REPRO_DIR picks another one (experiments): the ELF and vk then differ,
+# and the script says so ("canonical no").
+#
+# Usage: tools/repro-guest-build.sh   (prints elf_sha256, canonical yes|no, the ELF path)
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-BASE=${PH_REPRO_DIR:-/tmp/ph-repro}
+CANONICAL=/tmp/ph-repro
+BASE=${PH_REPRO_DIR:-$CANONICAL}
 mkdir -p "$BASE"
 BASE=$(cd "$BASE" && pwd -P)
 # /tmp is shared: a directory another user created, or can write to, could hold
@@ -43,4 +48,9 @@ env -u RUSTC RUSTUP_TOOLCHAIN=succinct RUSTC="$RUSTC_BIN" RUSTC_BOOTSTRAP=1 \
     cargo build --locked --release --target riscv64im-succinct-zkvm-elf >&2
 ELF="$BASE/target/riscv64im-succinct-zkvm-elf/release/ph-program"
 echo "elf_sha256 $(shasum -a 256 "$ELF" | cut -d' ' -f1)"
+if [ "$BASE" = "$(cd "$CANONICAL" 2>/dev/null && pwd -P)" ]; then
+    echo "canonical yes"
+else
+    echo "canonical no"
+fi
 echo "elf $ELF"
