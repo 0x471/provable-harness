@@ -72,3 +72,7 @@ test = ["std", "arbitrary", "arbitrary/derive"]
 [badges.travis-ci]
 branch = "master"
 repository = "bodil/smartstring"
+
+# (provable-harness patch) The cfgs set by build.rs; a path dependency gets lints.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(has_allocator)", "cfg(needs_allocator_feature)"] }
