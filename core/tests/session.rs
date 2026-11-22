@@ -716,3 +716,30 @@ fn rewritten_rhai_functions_keep_upstream_behaviour() {
     let want = r#"[[1,3,5],[2,4],[3,4,5],[1,2],[2,3],[2,3],"abxyx","azzz","a","hello"]"#;
     assert!(out.contains(want), "{out}");
 }
+
+/// A model that reports its first reply as cut off at max_tokens.
+struct TruncatingModel(SigningModel);
+
+impl ModelBackend for TruncatingModel {
+    fn complete(&mut self, q: &ModelQuery<'_>) -> Result<String, HarnessError> {
+        self.0.complete(q)
+    }
+    fn truncated(&self) -> bool {
+        self.0.recorded.len() == 1
+    }
+}
+
+/// Nothing in a reply that stopped at max_tokens runs: it may hold only the
+/// start of a script, which can still parse and do something else.
+#[test]
+fn truncated_reply_runs_nothing() {
+    let mut model = TruncatingModel(SigningModel {
+        replies: vec![script("write_file(\"/out/a.md\", \"x\");"), "done".into()],
+        recorded: vec![],
+    });
+    let tools: Rc<RefCell<dyn ToolBackend>> = Rc::new(RefCell::new(SigningOracle::default()));
+    let out = ph_core::run_session(&input(), &[9u8; 32], &mut model, tools).unwrap();
+    assert!(out.messages[2].content.contains("not run: the reply stopped at max_tokens"), "{}", out.messages[2].content);
+    assert_eq!((out.claim.scripts, out.claim.calls_allowed), (0, 0));
+    assert!(out.final_workspace.iter().all(|f| f.path != "/out/a.md"));
+}

@@ -70,6 +70,7 @@ pub struct LiveZkTlsModel {
     provider: ph_core::zktls::CryptoProvider,
     pub recorded: Vec<ModelEvidence>,
     times: Option<(u64, u64)>,
+    truncated: bool,
 }
 
 /// Overloaded / rate-limited / server errors worth retrying.
@@ -116,8 +117,9 @@ impl ModelBackend for LiveZkTlsModel {
             eprintln!("[zktls] step {}: API answered {status}; retry {attempt}/{MAX_RETRIES} in {wait:?}", q.step);
             std::thread::sleep(wait);
         };
-        let (text, time) = verify_zktls_step(&self.provider, c, q, &bytes)?;
+        let (text, time, truncated) = verify_zktls_step(&self.provider, c, q, &bytes)?;
         self.times = widen(self.times, time);
+        self.truncated = truncated;
         eprintln!(
             "[zktls] step {} notarized: {} presentation bytes, time {time}",
             q.step,
@@ -129,6 +131,10 @@ impl ModelBackend for LiveZkTlsModel {
 
     fn attested_time_range(&self) -> Option<(u64, u64)> {
         self.times
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
     }
 }
 
@@ -248,6 +254,7 @@ pub fn run_live(
                 config: config.clone(),
                 recorded: vec![],
                 times: None,
+                truncated: false,
             };
             let out = ph_core::run_session(input, &blind, &mut model, tools.clone())?;
             (out, model.recorded)

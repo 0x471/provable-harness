@@ -95,6 +95,11 @@ pub trait ModelBackend {
     fn attested_time_range(&self) -> Option<(u64, u64)> {
         None
     }
+    /// Whether the reply just returned stopped at `max_tokens` (zkTLS backends:
+    /// the attested `stop_reason`). The session runs nothing from such a reply.
+    fn truncated(&self) -> bool {
+        false
+    }
     /// Called once after the session loop (replay checks the witness is fully used).
     fn finish(&mut self) -> Result<(), HarnessError> {
         Ok(())

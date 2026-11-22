@@ -163,7 +163,7 @@ impl ModelBackend for LiveTls<'_> {
             .block_on(notarize(&self.s.notary, &self.s.target, req))
             .map_err(|e| HarnessError::Backend(format!("{e:#}")))?;
         let provider = crypto_provider(c).unwrap();
-        let (text, t) = verify_zktls_step(&provider, c, q, &p)?;
+        let (text, t, _) = verify_zktls_step(&provider, c, q, &p)?;
         self.times = widen(self.times, t);
         self.recorded.push(ModelEvidence::Tls(p));
         Ok(text)

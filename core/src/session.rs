@@ -11,7 +11,7 @@ use crate::hash::{text_hash, Digest};
 use crate::policy::Policy;
 use crate::protocol::{context_append, context_genesis, model_request_hash, Message, ModelQuery, Role};
 use crate::render::render_report;
-use crate::script::{build_engine, init_rhai, run_native_turn, run_script, ToolEnv};
+use crate::script::{build_engine, init_rhai, run_native_turn, run_script, skipped_native_turn, ScriptReport, ToolEnv};
 use crate::workspace::{Workspace, WorkspaceFile};
 use crate::zktls::{ModelAuth, ToolAuth};
 use crate::{HarnessError, ModelBackend, ToolBackend};
@@ -19,6 +19,9 @@ use crate::{HarnessError, ModelBackend, ToolBackend};
 /// Opening fence of a code-mode action. The script runs to the next line that
 /// starts with ``` (or to the end of the reply if the fence is never closed).
 pub const SCRIPT_FENCE: &str = "```rhai\n";
+
+/// Tool result for a reply that stopped at `max_tokens`.
+const TRUNCATED: &str = "not run: the reply stopped at max_tokens before it ended";
 
 /// Everything the session depends on besides model and tool I/O.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +177,7 @@ pub fn run_session(
             request_hash: model_request_hash(&ctx, step),
         };
         let text = model.complete(&query)?;
+        let truncated = model.truncated();
         steps += 1;
 
         if native {
@@ -207,8 +211,13 @@ pub fn run_session(
                     .collect();
                 break;
             }
-            scripts += 1;
-            let results = run_native_turn(&env, &input.tool_mode, &uses, input.policy.max_output_chars as usize)?;
+            // A reply cut off at max_tokens may end inside a tool call: run none.
+            let results = if truncated {
+                skipped_native_turn(&uses, TRUNCATED)
+            } else {
+                scripts += 1;
+                run_native_turn(&env, &input.tool_mode, &uses, input.policy.max_output_chars as usize)?
+            };
             let tool_msg = Message {
                 role: Role::ToolResults,
                 content: results,
@@ -233,8 +242,16 @@ pub fn run_session(
                 break;
             }
             Some(code) => {
-                scripts += 1;
-                let report = run_script(&engine, &env, &code)?;
+                // A reply cut off at max_tokens has only a prefix of its script.
+                let report = if truncated {
+                    ScriptReport {
+                        error: Some(TRUNCATED.into()),
+                        ..ScriptReport::default()
+                    }
+                } else {
+                    scripts += 1;
+                    run_script(&engine, &env, &code)?
+                };
                 let tool_msg = Message {
                     role: Role::Tool,
                     content: render_report(&report, input.policy.max_output_chars as usize),

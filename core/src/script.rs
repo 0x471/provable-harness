@@ -762,6 +762,19 @@ pub(crate) fn run_native_turn(
     Ok(out)
 }
 
+/// Tool results for a turn that is not run: every call gets `msg` as an error.
+pub(crate) fn skipped_native_turn(uses: &[(String, String, serde_json::Value)], msg: &str) -> String {
+    let mut out = String::from("[");
+    for (i, (id, ..)) in uses.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        crate::anthropic::tool_result_block(&mut out, id, msg, true);
+    }
+    out.push(']');
+    out
+}
+
 pub(crate) fn run_script(
     engine: &Engine,
     env: &Rc<RefCell<ToolEnv>>,

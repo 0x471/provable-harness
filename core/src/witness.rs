@@ -107,6 +107,7 @@ pub struct WitnessModel {
     verifier: ModelVerifier,
     responses: std::vec::IntoIter<ModelEvidence>,
     times: Option<(u64, u64)>,
+    truncated: bool,
 }
 
 impl WitnessModel {
@@ -145,18 +146,20 @@ impl WitnessModel {
             verifier,
             responses: responses.into_iter(),
             times: None,
+            truncated: false,
         })
     }
 }
 
-/// Verify one zkTLS model step and return the reply text and notarized time.
-/// Shared by the replay backend and the host's live backend.
+/// Verify one zkTLS model step and return the reply text, the notarized time,
+/// and whether the reply stopped at `max_tokens`. Shared by the replay backend
+/// and the host's live backend.
 pub fn verify_zktls_step(
     provider: &tlsn_attestation::CryptoProvider,
     config: &ZkTlsConfig,
     q: &ModelQuery<'_>,
     presentation: &[u8],
-) -> Result<(String, u64), HarnessError> {
+) -> Result<(String, u64, bool), HarnessError> {
     let body = request_body(
         &config.model,
         config.max_tokens,
@@ -169,7 +172,7 @@ pub fn verify_zktls_step(
     let slot = Slot::model(q.session_id, q.step);
     let (reply, time) = verify_model_exchange(provider, config, presentation, &body, &slot, !q.tools.is_empty())
         .map_err(|e| HarnessError::Attestation(format!("zkTLS model reply for step {}: {e}", q.step)))?;
-    Ok((reply.text, time))
+    Ok((reply.text, time, reply.stop_reason == "max_tokens"))
 }
 
 pub fn widen(range: Option<(u64, u64)>, t: u64) -> Option<(u64, u64)> {
@@ -184,6 +187,7 @@ impl ModelBackend for WitnessModel {
         let r = self.responses.next().ok_or_else(|| {
             HarnessError::Witness(format!("no model response for step {}", q.step))
         })?;
+        self.truncated = false;
         match (&self.verifier, r) {
             (ModelVerifier::Gateway(key), ModelEvidence::Signed(r)) => {
                 let digest =
@@ -194,8 +198,9 @@ impl ModelBackend for WitnessModel {
                 Ok(r.text)
             }
             (ModelVerifier::ZkTls { config, provider }, ModelEvidence::Tls(bytes)) => {
-                let (text, time) = verify_zktls_step(provider, config, q, &bytes)?;
+                let (text, time, truncated) = verify_zktls_step(provider, config, q, &bytes)?;
                 self.times = widen(self.times, time);
+                self.truncated = truncated;
                 Ok(text)
             }
             _ => Err(HarnessError::Witness(format!(
@@ -207,6 +212,10 @@ impl ModelBackend for WitnessModel {
 
     fn attested_time_range(&self) -> Option<(u64, u64)> {
         self.times
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
     }
 
     fn finish(&mut self) -> Result<(), HarnessError> {
