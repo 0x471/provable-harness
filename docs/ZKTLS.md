@@ -56,8 +56,9 @@ In the guest, SHA-256, P-256, secp256k1 (notary key) and RSA are accelerated by 
 1. The attestation is signed by the **pinned notary key** under the **pinned signature scheme**. TLSNotary's own verify only checks the signature against whatever key is embedded, so pinning is our responsibility.
    - Pinning the key alone is not enough. TLSNotary accepts both `secp256k1` and the Keccak-prehashed `secp256k1eth` for one k256 key. Also, *any* TLSNotary notary holding that key (e.g. a stock notary server, or a second process with its own slot journal) would sign without enforcing the one-reply-per-slot rule.
    - So the ph notary uses its own scheme: TLSNotary private-use signature id `0xA1`, ECDSA secp256k1/SHA-256 over `"provable-harness/notary-attestation/v1\0" || header`. The guest accepts only that scheme.
-   - Test `only_the_ph_notary_scheme_is_accepted`: `secp256k1` and `secp256k1eth` re-signatures of the fixture (valid under upstream rules), another key, and the scheme without the domain are all rejected. The e2e tests show an upstream-tlsn notary with this signer verifies in the forked guest.
-   - Attestations carrying extensions are rejected (the notary's default config already refuses them).
+   - The guest's TLSNotary provider replaces the library's built-in schemes with verifiers that always refuse, so a presentation signed under any of them fails inside verification already; a check after verification also requires the pinned scheme.
+   - Test `only_the_ph_notary_scheme_is_accepted`: `secp256k1` and `secp256k1eth` re-signatures of the fixture (valid under upstream rules, checked with an upstream-default provider), another key, and the scheme without the domain are all rejected. The e2e tests show an upstream-tlsn notary with this signer verifies in the forked guest.
+   - The notary refuses extensions requested by the prover; check 4 requires the one it writes itself.
 2. The **server identity proof** is present, names `host`, and its certificate chain is valid at the notarized time under the configured roots (`Mozilla` compiled into the guest, or a pinned list).
 3. The protocol is TLS 1.2, and the transcript is present and **complete**: not a single byte redacted, in either direction (see section 5.1).
 4. The attestation carries exactly one extension, written by the notary itself: the slot `model <session> <step>` it consumed (section 4). It must equal the guest's own (session, step).
@@ -67,7 +68,7 @@ In the guest, SHA-256, P-256, secp256k1 (notary key) and RSA are accelerated by 
 6. The response is exactly one `HTTP/1.1 200` message with unambiguous framing:
    - Content-Length XOR chunked;
    - no duplicates, no chunk extensions, no trailers, no trailing bytes.
-7. The body is a Messages-API `message` from `assistant`, and comes from the requested model (or a dated snapshot of it). `text` blocks form the reply; `thinking` / `redacted_thinking` blocks are skipped (current models think by default); any other block type is rejected.
+7. The body is a Messages-API `message` from `assistant`, and comes from the requested model or a dated snapshot of it (`<model>-YYYYMMDD`; any other suffix is another model). `text` blocks form the reply; `thinking` / `redacted_thinking` blocks are skipped (current models think by default); any other block type is rejected. If `stop_reason` is `max_tokens`, the session runs nothing from the reply (DESIGN.md 13.2).
 8. The notarized time is included in the claim (`tls_time_range`). `ph verify --tls-max-age-secs` enforces freshness.
 
 ## 4. Re-roll protection: the notary's role
@@ -86,18 +87,21 @@ Model outputs are samples. If an operator could sample several times and keep th
 
 ### 4.1 Notary hardening and signed session logs
 
-- **Operator authentication.** `ph-zktls notary --operator-tokens <file>`: the prover must open with `PH-AUTH <token>` (set `PH_NOTARY_TOKEN` for the proxy). Without it, anyone who can reach the notary and knows a session id could burn that session's slots. Unauthorized openings are refused before any slot is touched.
+- **Operator authentication.** `ph-zktls notary --operator-tokens <file>`: the prover must open with `PH-AUTH <token>` (set `PH_NOTARY_TOKEN` for the proxy). Without it, anyone who can reach the notary and knows a session id could burn that session's slots, so the notary refuses to start without tokens on a non-loopback address unless given `--open`. Unauthorized openings are refused before any slot is touched. Slots are not tied to a token: operators holding tokens can still burn each other's slots, so an eval's notary should give tokens only to that eval's operator.
+- **Bounded input.** The attestation request the notary reads after MPC is capped at 1 MiB. `ph-zktls keygen` writes the key owner-only and never over an existing file.
 - **Timeouts and load.** The notary allows 10 s for the opening lines and 180 s for the whole MPC-TLS session (a timeout burns the slot, like any abort). At most `--max-sessions` (default 8) sessions run concurrently; more get `REFUSED busy`.
-- **Journal v3.** The journal records `C` (consumed), `R` (released after an authenticated non-200 model reply), and `D` (attestation signed). The `D` record is fsynced *before* the attestation is sent. A crash in between therefore shows as "signed", which is a visible missing run, never as an unrecorded attestation. v2 journals cannot tell signed slots from aborted ones, so they are refused: start a new journal with a new key, because a fresh journal under the old key would allow re-rolls.
-- **Signed session logs.** A proof shows the runs the operator *delivered*. The notary saw every slot it handed out. `ph-zktls session-log --key --state --sessions-file <ids> --out log.json` signs each listed session's slot histories (`core/src/notary_log.rs`; domain `ph/v1/notary-session-log`).
+- **Journal v4.** The journal records `C` (consumed), `R` (released after an authenticated non-200 model reply), `D` (attestation signed) and `P` (an eval pre-registration, with the notary's clock). The `D` record is fsynced *before* the attestation is sent, so a crash in between shows as "signed", a visible missing run, never as an unrecorded attestation; `P` is fsynced before the receipt is sent. Older journals are refused: start a new journal with a new key, because a fresh journal under the old key would allow re-rolls.
+- **Pre-registration receipts.** An opening line `PH-PREREG <suite hash> <pre-registration hash>` (after `PH-AUTH` if required) makes the notary journal the pre-registration with its own time and answer `OK <time> <signature>`, a k256 signature over `H("ph/v1/notary-prereg-receipt", suite, pre-registration, time)`. `ph eval prereg --notary <addr>` asks for it and stores it in the pre-registration file; `ph eval verify` requires it to predate the drand round (EVALS.md).
+- **Signed session logs.** A proof shows the runs the operator *delivered*. The notary saw every slot it handed out. `ph-zktls session-log --key --state --sessions-file <ids> --out log.json` signs each listed session's slot histories and every pre-registration in the journal (`core/src/notary_log.rs`; domain `ph/v1/notary-session-log`).
 
   `ph eval verify --notary-log log.json` checks:
   - the log is signed by the pinned notary;
   - it covers every session of the eval;
-  - it was produced after the last notarized time;
-  - every delivered run's model slots `0..steps` are exactly the ones the notary signed (`notary_log::reconcile`).
+  - it was produced after the last notarized time and, with `--log-not-before <time>`, after a time the verifier chooses (a log made before a run cannot show it, so ask the notary for a fresh one);
+  - every delivered run's model slots `0..steps` are exactly the ones the notary signed (`notary_log::reconcile`);
+  - with a pre-registered seed: the notary saw exactly one pre-registration of this suite, this one.
 
-  For missing runs, the verifier then sees whether each one was **never started**, **aborted** (and at which step), or **withheld**: completed, with signed replies, but not delivered. That turns selective reporting from invisible into visible.
+  For missing runs, the verifier then sees whether each one was **never started**, or **started and not delivered**, with the number of model replies the notary signed for it and the slot it stopped in, if any. Aborting during a step and withholding a finished run are reported together: both are the operator's choice, and one extra announcement after a finished run would otherwise make a withheld run look aborted.
 
 ### 4.2 Native tool use over zkTLS
 
@@ -152,18 +156,18 @@ So the presentation discloses everything, the guest checks the key's charset (no
 | Notary slot state is durable | `ph-zktls notary --state <file>` keeps an append-only journal, bound to the notary key by its first line. Each change is `fsync`ed before the notary acts on it, the file is exclusively locked, and a torn final line is dropped. Still assumed: the disk is not rolled back (e.g. a VM snapshot restore), and the operator never runs two notaries with the same key but different journals. `fsync` on macOS is not `F_FULLFSYNC`. |
 | WebPKI: the roots, and the CA that issued `api.anthropic.com`'s certificate | A mis-issued certificate breaks server authentication, as it would for any TLS client. `TlsRoots::Custom` lets a verifier pin, e.g., GTS Root R4 only. |
 | Anthropic's server runs the model it reports | zkTLS proves *what the server said*, not how it computed it. |
-| The TLS endpoint: `api.anthropic.com` terminates TLS at Cloudflare (`Server: cloudflare` in the fixture) | The proof is about what the certificate holder's edge sent. The CDN is inside the trust boundary. |
+| The TLS endpoint: `api.anthropic.com` terminates TLS at Cloudflare (`Server: cloudflare` in the real exchanges recorded during development; the committed fixture is a mock) | The proof is about what the certificate holder's edge sent. The CDN is inside the trust boundary. |
 | No revocation checking | A revoked but unexpired certificate is accepted. Use pinned roots (`TlsRoots::Custom` with GTS roots) and a short `--tls-max-age-secs`. |
 | The verifier's anchors (notary key, roots) are its own | If the operator supplies `zktls.json`, it can name its own notary or CA and forge everything. `ph verify` prints the anchors and warns on custom roots. |
 | The proxy holds the API key and has no login | Anything that can reach `127.0.0.1:7050` can spend the key. Requests carrying an `Origin` header, or without `Content-Type: application/json`, get 403, so a web page cannot use the proxy (browsers attach `Origin` to cross-site POSTs, and need a CORS preflight to send JSON). Local processes are not stopped: keep the proxy on localhost, run it only while needed, and use a short-lived, spend-limited key. |
-| Who may request slots | With `--operator-tokens`, only operators holding a token can open a session; openings time out after 10 s and MPC sessions after 180 s, and at most `--max-sessions` run at once. Without tokens, anyone who can reach the notary and knows a challenge can burn its slots (griefing). |
+| Who may request slots | With `--operator-tokens`, only operators holding a token can open a session; openings time out after 10 s and MPC sessions after 180 s, and at most `--max-sessions` run at once. Token holders can still burn each other's slots; without tokens (loopback, or `--open`), anyone who can reach the notary and knows a challenge can (griefing). The session log shows burned slots as runs that were started and not delivered. |
 | SP1 and the guest code | As in DESIGN.md. |
 
 ### 5.3 Other limits
 
 - **TLS 1.2 only.** TLSNotary beta.1 lacks TLS 1.3. `api.anthropic.com` currently offers `ECDHE-ECDSA-AES128-GCM-SHA256` over TLS 1.2, which works.
 - **MPC limits.** Requests and responses are capped at 32 KiB (`MAX_SENT`, `MAX_RECV`). `max_tokens` is capped at 2048 (`zktls::MAX_TOKENS`) so replies fit; exceeding the limit is a hard MPC error after the slot is consumed. Long agent sessions need larger limits (MPC cost grows with sent bytes) or context management.
-- **Retries.** An authenticated 429/5xx/529 is released by the notary; the live host retries it up to 4 times with backoff. Any other failure burns the slot and ends the challenged session. The witness is not saved per step, so a session cannot be resumed after a crash.
+- **Retries.** An authenticated 429/5xx/529 is released by the notary; the live host retries it up to 4 times with backoff. Any other failure burns the slot and ends the challenged session. A single session's witness is not saved per step, so it cannot be resumed after a crash; `ph eval run` saves each finished run's evidence and resumes from it.
 - **Tool calls.** Same limits (32 KiB each way, TLS 1.2, ECDHE with AES-GCM suites). Sites that only offer TLS 1.3, or that send close-delimited, compressed or larger responses, fail or return `ok = false`. No authentication headers exist (no credentials), so only public endpoints can be called.
 - **Model ids.** `-latest` aliases are rejected in the config: the API reports the resolved dated id, which would only be caught after the slot was consumed.
 - **Cost.**
@@ -175,6 +179,8 @@ So the presentation discloses everything, the guest checks the key's charset (no
 - **Guest RNG.** The guest prints SP1's "insecure random number generator" warning. That RNG is a deterministic, fixed-seed `StdRng`, used only to seed `HashMap` hashing inside TLSNotary's verifier. All uses are keyed lookups or duplicate counts, so verification outcomes do not depend on it.
 
 ## 6. Measured (Apple M4 Pro, 24 GB, SP1 v6.10 CPU prover)
+
+These were measured on earlier program versions (each change to the program gives a new vk); the cost structure is unchanged.
 
 | Item | Value |
 |---|---|
@@ -233,6 +239,7 @@ ph-zktls keygen --out notary.key                   # prints the public key
 ph-zktls notary --key notary.key --state notary-slots.log --addr 0.0.0.0:7047 \
     --operator-tokens operators.txt                # one token (>= 16 bytes) per line
 ph-zktls session-log --key notary.key --state notary-slots.log --sessions-file ids.txt --out log.json
+# (run it when a verifier asks, so the log is fresh)
 # operator
 PH_NOTARY_TOKEN=... ph-zktls proxy --notary <notary-host>:7047 --api-key-env PH_ANTHROPIC_KEY
 # the proxy spends the key for whoever reaches it: keep it on 127.0.0.1, stop it
