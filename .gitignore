@@ -6,7 +6,8 @@
 /vendor/tlsn/target
 witness.bin
 *.presentation.tlsn
-!/core/tests/fixtures/*.presentation.tlsn
+# The one committed presentation: recorded against the mock API with a fake key.
+!/core/tests/fixtures/mock-anthropic.presentation.tlsn
 # SP1 proofs of real sessions can contain witness data (e.g. the API key): never commit.
 proof.bin
 # Eval inputs contain zkTLS presentations (with the API key): never commit.
@@ -16,3 +17,12 @@ eval-input.bin
 /fuzz/artifacts
 /fuzz/*.log
 /fuzz/Cargo.lock
+# Run disclosures (transcripts and final workspaces can hold secret data),
+# notary operator tokens and environment files.
+transcript.json
+final_workspace.json
+actions.json
+evidence.bin
+operators*.txt
+.env
+.env.*
