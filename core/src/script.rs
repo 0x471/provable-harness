@@ -260,6 +260,14 @@ impl OpsMeter {
         }
         !self.data_exhausted.get()
     }
+
+    fn charge_or_stop(&self, units: u64) -> Result<(), Box<EvalAltResult>> {
+        if self.charge(units) {
+            Ok(())
+        } else {
+            Err(terminated())
+        }
+    }
 }
 
 impl ToolEnv {
@@ -354,6 +362,103 @@ fn terminated() -> Box<EvalAltResult> {
 /// Longest script the harness compiles. Parsing is not metered, so its cost is
 /// bounded by the length.
 pub const MAX_SCRIPT_BYTES: usize = 32 * 1024;
+
+/// Meter units per input byte of `parse_json`, on top of the call's own charge.
+const JSON_WEIGHT: u64 = 32;
+
+/// Meter units per non-ASCII byte of a case mapping (`to_upper`, ...), on top of
+/// the call's own charge: Unicode case tables cost far more than ASCII.
+const CASE_WEIGHT: u64 = 32;
+
+/// Meter units per match of `replace`: each costs a search restart and a copy.
+const MATCH_WEIGHT: u64 = 16;
+
+fn data_too_large() -> Box<EvalAltResult> {
+    EvalAltResult::ErrorDataTooLarge("Length of string".into(), Position::NONE).into()
+}
+
+/// `replace` as in Rhai's string package, but the result's length is checked
+/// and charged before it is built: Rhai builds it first (512 MiB from a 64 KiB
+/// string) and checks afterwards.
+fn replace_checked(
+    meter: &OpsMeter,
+    max: usize,
+    s: &mut rhai::ImmutableString,
+    find: &str,
+    sub: &str,
+) -> Result<(), Box<EvalAltResult>> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    let n = s.matches(find).count();
+    let len = (s.len() - n * find.len()).saturating_add(n.saturating_mul(sub.len()));
+    if len > max {
+        return Err(data_too_large());
+    }
+    meter.charge_or_stop(1 + len as u64 + MATCH_WEIGHT * n as u64)?;
+    *s = s.replace(find, sub).into();
+    Ok(())
+}
+
+fn charge_case(meter: &OpsMeter, s: &str) -> Result<(), Box<EvalAltResult>> {
+    let wide = s.bytes().filter(|b| !b.is_ascii()).count() as u64;
+    meter.charge_or_stop(CASE_WEIGHT * wide)
+}
+
+/// Metered replacements for string functions whose cost Rhai's meter misses.
+/// Behaviour is Rhai's own (same early returns), except that an oversized
+/// `replace` fails before it changes the string.
+fn register_metered_strings(engine: &mut Engine, meter: &Rc<OpsMeter>, max: usize) {
+    use rhai::ImmutableString as S;
+    let m = meter.clone();
+    engine.register_fn("replace", move |s: &mut S, f: &str, r: &str| replace_checked(&m, max, s, f, r));
+    let m = meter.clone();
+    engine.register_fn("replace", move |s: &mut S, f: &str, r: char| {
+        replace_checked(&m, max, s, f, &r.to_string())
+    });
+    let m = meter.clone();
+    engine.register_fn("replace", move |s: &mut S, f: char, r: &str| {
+        replace_checked(&m, max, s, &f.to_string(), r)
+    });
+    let m = meter.clone();
+    engine.register_fn("replace", move |s: &mut S, f: char, r: char| {
+        replace_checked(&m, max, s, &f.to_string(), &r.to_string())
+    });
+    let m = meter.clone();
+    engine.register_fn("to_upper", move |s: S| -> Result<S, Box<EvalAltResult>> {
+        charge_case(&m, &s)?;
+        if s.chars().all(char::is_uppercase) {
+            return Ok(s);
+        }
+        Ok(s.to_uppercase().into())
+    });
+    let m = meter.clone();
+    engine.register_fn("make_upper", move |s: &mut S| -> Result<(), Box<EvalAltResult>> {
+        charge_case(&m, s)?;
+        if s.is_empty() || s.chars().all(char::is_uppercase) {
+            return Ok(());
+        }
+        *s = s.to_uppercase().into();
+        Ok(())
+    });
+    let m = meter.clone();
+    engine.register_fn("to_lower", move |s: S| -> Result<S, Box<EvalAltResult>> {
+        charge_case(&m, &s)?;
+        if s.is_empty() || s.chars().all(char::is_lowercase) {
+            return Ok(s);
+        }
+        Ok(s.to_lowercase().into())
+    });
+    let m = meter.clone();
+    engine.register_fn("make_lower", move |s: &mut S| -> Result<(), Box<EvalAltResult>> {
+        charge_case(&m, s)?;
+        if s.is_empty() || s.chars().all(char::is_lowercase) {
+            return Ok(());
+        }
+        *s = s.to_lowercase().into();
+        Ok(())
+    });
+}
 
 pub(crate) fn invoke(
     env: &Rc<RefCell<ToolEnv>>,
@@ -567,9 +672,12 @@ pub(crate) fn build_engine(env: &Rc<RefCell<ToolEnv>>, policy: &Policy) -> Engin
         engine.register_fn(name, |s: &str| render::json_quote(s));
         engine.register_fn(name, |c: char| render::json_quote(c.encode_utf8(&mut [0u8; 4])));
     }
-    engine.register_fn("parse_json", |s: &str| -> Result<Dynamic, Box<EvalAltResult>> {
+    let m = env.borrow().ops.clone();
+    engine.register_fn("parse_json", move |s: &str| -> Result<Dynamic, Box<EvalAltResult>> {
+        m.charge_or_stop(JSON_WEIGHT * s.len() as u64)?;
         render::parse_json(s).map_err(runtime_error)
     });
+    register_metered_strings(&mut engine, &env.borrow().ops, policy.max_string_bytes as usize);
 
     let e = env.clone();
     engine.on_print(move |s| e.borrow_mut().push_stdout(s));
