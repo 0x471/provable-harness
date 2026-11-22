@@ -480,6 +480,9 @@ fn prereg_receipt(state: &NotaryState, secret: &[u8; 32], suite: &[u8; 32], prer
     Ok(format!("OK {time} {}\n", hex::encode(sig.to_vec())))
 }
 
+/// Largest attestation request the notary reads (a real one is a few KB).
+const MAX_ATTESTATION_REQUEST: usize = 1 << 20;
+
 /// Time allowed for the opening lines, and for the whole MPC-TLS exchange.
 pub const OPENING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -690,7 +693,10 @@ async fn notary_mpc<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     handle.close();
     let mut socket = driver_task.await??;
     let mut req_bytes = Vec::new();
-    socket.read_to_end(&mut req_bytes).await?;
+    (&mut socket).take(MAX_ATTESTATION_REQUEST as u64 + 1).read_to_end(&mut req_bytes).await?;
+    if req_bytes.len() > MAX_ATTESTATION_REQUEST {
+        bail!("attestation request larger than {MAX_ATTESTATION_REQUEST} bytes");
+    }
     let request: AttestationRequest = bincode::deserialize(&req_bytes)?;
 
     let mut provider = CryptoProvider::default();
