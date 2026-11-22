@@ -111,6 +111,7 @@ impl Engine {
 
                         let context = (self, fn_name, None, &*global, pos).into();
 
+                        // (provable-harness patch) Meter the call and its arguments.
                         self.track_args_volume(args, pos)?;
                         func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
@@ -211,6 +212,7 @@ impl Engine {
                         // Add the first argument with the object pointer
                         args.insert(0, target.as_mut());
 
+                        // (provable-harness patch) Meter the call and its arguments.
                         self.track_args_volume(args, pos)?;
                         func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
@@ -390,6 +392,7 @@ impl Engine {
 
                         let context = (self, fn_name, None, &*global, pos).into();
 
+                        // (provable-harness patch) Meter the call and its arguments.
                         self.track_args_volume(args, pos)?;
                         func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))
@@ -526,6 +529,7 @@ impl Engine {
 
                         let context = (self, fn_name, None, &*global, pos).into();
 
+                        // (provable-harness patch) Meter the call and its arguments.
                         self.track_args_volume(args, pos)?;
                         return func(context, args)
                             .and_then(|r| self.check_data_size(r, pos))

@@ -1051,6 +1051,7 @@ impl Engine {
                 let context = func
                     .has_context()
                     .then(|| (self, fn_name, module.id(), &*global, pos).into());
+                // (provable-harness patch) Meter the call and its arguments.
                 self.track_args_volume(args, pos)?;
                 func.call(context, args)
                     .and_then(|r| self.check_data_size(r, pos))
@@ -1066,6 +1067,7 @@ impl Engine {
             ) => {
                 let context =
                     has_context.then(|| (self, fn_name, module.id(), &*global, pos).into());
+                // (provable-harness patch) Meter the call and its arguments.
                 self.track_args_volume(args, pos)?;
                 func(context, args).and_then(|r| self.check_data_size(r, pos))
             }
