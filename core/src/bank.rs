@@ -244,16 +244,20 @@ impl Bank {
                 ("iban", None) => ok(a.iban.clone()),
                 ("balance", None) => ok(py_float(a.balance.0)),
                 ("transactions", q) => {
-                    // get_most_recent_transactions(n=100): the last n transactions.
+                    // get_most_recent_transactions(n=100): `transactions[-int(n):]`,
+                    // with Python's slicing: n = 0 returns all of them, n = -1 all
+                    // but the first.
                     let n = match q {
-                        None => 100usize,
-                        Some(q) => match q.strip_prefix("n=").and_then(|v| v.parse::<usize>().ok()) {
+                        None => 100i64,
+                        Some(q) => match q.strip_prefix("n=").and_then(|v| v.parse::<i64>().ok()) {
                             Some(n) => n,
                             None => return fail("ValidationError: n: Input should be a valid integer".into()),
                         },
                     };
-                    let skip = a.transactions.len().saturating_sub(n);
-                    ok(serde_json::to_string(&a.transactions[skip..]).expect("serializable"))
+                    let len = a.transactions.len() as i64;
+                    let start = n.checked_neg().unwrap_or(i64::MAX);
+                    let skip = if start >= 0 { start.min(len) } else { (len + start).max(0) };
+                    ok(serde_json::to_string(&a.transactions[skip as usize..]).expect("serializable"))
                 }
                 ("scheduled_transactions", None) => {
                     ok(serde_json::to_string(&a.scheduled_transactions).expect("serializable"))
@@ -406,6 +410,22 @@ mod tests {
                 password: "password123".into(),
             },
         }
+    }
+
+    /// `transactions[-int(n):]` as in Python.
+    #[test]
+    fn recent_transactions_slice_like_python() {
+        let mut b = bank();
+        let ids = |r: ToolResult| -> Vec<i64> {
+            assert!(r.ok, "{}", r.output);
+            let v: Vec<serde_json::Value> = serde_json::from_str(&r.output).unwrap();
+            v.iter().map(|t| t["id"].as_i64().unwrap()).collect()
+        };
+        let url = |q: &str| format!("https://bank.example/api/transactions{q}");
+        for (q, want) in [("", vec![1, 2]), ("?n=1", vec![2]), ("?n=5", vec![1, 2]), ("?n=0", vec![1, 2]), ("?n=-1", vec![2]), ("?n=-5", vec![])] {
+            assert_eq!(ids(call(&mut b, "http_get", &[&url(q)])), want, "{q}");
+        }
+        assert!(!call(&mut b, "http_get", &[&url("?n=x")]).ok);
     }
 
     fn call(b: &mut Bank, tool: &str, args: &[&str]) -> ToolResult {
