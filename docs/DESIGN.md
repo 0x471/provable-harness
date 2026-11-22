@@ -302,6 +302,8 @@ Limits:
   | bank API | 6.9 M runs, clean |
   | signature differential vs ring (`webpki-algs`, 13 algorithms) | 548 k runs, no divergence |
 
+  After the review fixes changed the URL rule and the bank (2026-11-22), URL policy and bank API ran 10 minutes each again: 21.0 M and 9.7 M runs, clean.
+
 ## 13. Review fixes (2026-11-22, program vk `0x00923577...3943`, claim v7)
 
 An independent review found no input the guest accepts and should reject, but found weak spots around the proven statement. Besides the metering rework (12.2):
