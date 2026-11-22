@@ -38,6 +38,8 @@ pub mod domain {
     pub const EVAL_SUITE: &str = "ph/v1/eval-suite";
     pub const EVAL_SESSION: &str = "ph/v1/eval-session";
     pub const NOTARY_LOG: &str = "ph/v1/notary-session-log";
+    pub const CLAIM_SALT: &str = "ph/v1/claim-salt";
+    pub const SALTED: &str = "ph/v1/salted-commitment";
 }
 
 pub struct Hasher(Sha256);

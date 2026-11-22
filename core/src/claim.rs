@@ -2,9 +2,31 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::hash::{to_hex, Digest};
+use crate::hash::{domain, to_hex, Digest, Hasher};
 
-pub const CLAIM_VERSION: u32 = 6;
+pub const CLAIM_VERSION: u32 = 7;
+
+/// Labels of the claim's salted commitments (see `claim_salt`).
+pub const SALT_TRANSCRIPT: &str = "transcript";
+pub const SALT_FINAL_WORKSPACE: &str = "final-workspace";
+pub const SALT_FINAL_ANSWER: &str = "final-answer";
+
+/// Salt of one of the claim's commitments to private data, derived from the
+/// run's private blinding seed. Unsalted, a guessable answer or file could be
+/// confirmed from the public claim alone. The host discloses a salt together
+/// with the data it opens (transcript.json, final_workspace.json).
+pub fn claim_salt(blind: &Digest, which: &str) -> Digest {
+    let mut h = Hasher::new(domain::CLAIM_SALT);
+    h.digest(blind).str(which);
+    h.finish()
+}
+
+/// `value` committed under `salt`.
+pub fn salted(salt: &Digest, value: &Digest) -> Digest {
+    let mut h = Hasher::new(domain::SALTED);
+    h.digest(salt).digest(value);
+    h.finish()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
@@ -33,13 +55,15 @@ pub struct Claim {
     pub system_prompt_hash: Digest,
     pub task_hash: Digest,
     pub initial_workspace_root: Digest,
+    /// Salted commitment to the final workspace's root.
     pub final_workspace_root: Digest,
-    /// Context-chain hash over every message (task, replies, tool results).
+    /// Salted commitment to the context-chain hash over every message (task,
+    /// replies, tool results).
     pub transcript_hash: Digest,
     /// Hash chain over every tool call: name, args, allow/deny, result digest.
     pub action_log_hash: Digest,
     pub outcome: Outcome,
-    /// `text_hash` of the model's final message.
+    /// Salted commitment to the `text_hash` of the model's final message.
     pub final_answer_hash: Digest,
     /// The final message itself, only if the session is untainted: a tainted
     /// session may have put secret data into it, and the claim is public.
@@ -82,7 +106,7 @@ impl Claim {
             Outcome::StepLimit => "step-limit",
         };
         format!(
-            "claim v{}\n  session_id           {}\n  model_id             {}\n  model_auth_hash      {}\n  tool_auth_hash       {}\n  tool_mode_hash       {}\n  policy_hash          {}\n  system_prompt_hash   {}\n  task_hash            {}\n  workspace root       {} -> {}\n  transcript_hash      {}\n  action_log_hash      {}\n  outcome              {}\n  steps / scripts      {} / {}\n  calls allowed/denied {} / {}\n  external calls       {}\n  tainted              {}\n  tls time range       {}\n  final_answer         {}",
+            "claim v{}\n  session_id           {}\n  model_id             {}\n  model_auth_hash      {}\n  tool_auth_hash       {}\n  tool_mode_hash       {}\n  policy_hash          {}\n  system_prompt_hash   {}\n  task_hash            {}\n  initial workspace    {}\n  final workspace      {} (salted)\n  transcript_hash      {} (salted)\n  action_log_hash      {}\n  outcome              {}\n  steps / scripts      {} / {}\n  calls allowed/denied {} / {}\n  external calls       {}\n  tainted              {}\n  tls time range       {}\n  final_answer         {}",
             self.version,
             to_hex(&self.session_id),
             self.model_id,
@@ -109,7 +133,7 @@ impl Claim {
             },
             match &self.final_answer {
                 Some(a) => crate::render::quote_preview(a, 400),
-                None => format!("(withheld: tainted session) hash {}", crate::hash::to_hex(&self.final_answer_hash)),
+                None => format!("(withheld: tainted session) salted hash {}", crate::hash::to_hex(&self.final_answer_hash)),
             },
         ) + match &self.eval {
             None => String::new(),

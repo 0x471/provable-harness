@@ -144,14 +144,12 @@ pub fn run(
                 fs::create_dir_all(&dir)?;
                 fs::write(
                     dir.join("transcript.json"),
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "session_id": to_hex(&input.session_id),
-                        "case": suite.cases[case].name,
-                        "repeat": repeat,
-                        "messages": output.messages,
-                    }))?,
+                    serde_json::to_string_pretty(&crate::scenario::Transcript::new(&input, &output, &witness.blind))?,
                 )?;
-                fs::write(dir.join("final_workspace.json"), serde_json::to_string_pretty(&output.final_workspace)?)?;
+                fs::write(
+                    dir.join("final_workspace.json"),
+                    serde_json::to_string_pretty(&crate::scenario::FinalWorkspace::new(&output, &witness.blind))?,
+                )?;
                 crate::write_actions(&dir, &output, &witness.blind)?;
                 runs.push(Some(RunEvidence {
                     blind: witness.blind,

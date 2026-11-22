@@ -223,6 +223,66 @@ pub struct Transcript {
     #[serde(default)]
     pub tools: String,
     pub messages: Vec<Message>,
+    /// Opens the claim's `transcript_hash` (see `ph_core::claim::claim_salt`).
+    pub salt: String,
+    /// Opens the claim's `final_answer_hash`.
+    pub answer_salt: String,
+}
+
+impl Transcript {
+    pub fn new(input: &ph_core::SessionInput, output: &ph_core::SessionOutput, blind: &Digest) -> Self {
+        use ph_core::claim::{claim_salt, SALT_FINAL_ANSWER, SALT_TRANSCRIPT};
+        Self {
+            session_id: to_hex(&input.session_id),
+            model_id: input.model_id.clone(),
+            system_prompt: input.system_prompt.clone(),
+            tools: input.tool_mode.tools_json(),
+            messages: output.messages.clone(),
+            salt: to_hex(&claim_salt(blind, SALT_TRANSCRIPT)),
+            answer_salt: to_hex(&claim_salt(blind, SALT_FINAL_ANSWER)),
+        }
+    }
+
+    /// The transcript's checks against a claim: (name, ok, detail).
+    pub fn check(&self, claim: &ph_core::Claim) -> Result<Vec<(&'static str, bool, String)>> {
+        use ph_core::claim::salted;
+        let sid = from_hex32(&self.session_id).context("bad session id in transcript")?;
+        let salt = from_hex32(&self.salt).context("bad salt in transcript")?;
+        let answer_salt = from_hex32(&self.answer_salt).context("bad answer_salt in transcript")?;
+        let ctx = ph_core::protocol::context_hash(&sid, &self.model_id, &self.system_prompt, &self.tools, &self.messages);
+        let answer = ph_core::session::final_answer_of(&self.messages, claim.outcome);
+        let t = salted(&salt, &ctx);
+        let a = salted(&answer_salt, &text_hash(&answer));
+        Ok(vec![
+            ("disclosed transcript", t == claim.transcript_hash, to_hex(&t)),
+            ("disclosed final answer", a == claim.final_answer_hash, to_hex(&a)),
+        ])
+    }
+}
+
+/// Selective-disclosure file for the final workspace: opens the claim's
+/// `final_workspace_root`.
+#[derive(Serialize, Deserialize)]
+pub struct FinalWorkspace {
+    pub salt: String,
+    pub files: Vec<WorkspaceFile>,
+}
+
+impl FinalWorkspace {
+    pub fn new(output: &ph_core::SessionOutput, blind: &Digest) -> Self {
+        use ph_core::claim::{claim_salt, SALT_FINAL_WORKSPACE};
+        Self {
+            salt: to_hex(&claim_salt(blind, SALT_FINAL_WORKSPACE)),
+            files: output.final_workspace.clone(),
+        }
+    }
+
+    /// The salted root, to compare with the claim's `final_workspace_root`.
+    pub fn commitment(&self) -> Result<Digest> {
+        let salt = from_hex32(&self.salt).context("bad salt in final_workspace.json")?;
+        let root = Workspace::new(&self.files).map_err(|e| anyhow::anyhow!("final_workspace.json: {e}"))?.root();
+        Ok(ph_core::claim::salted(&salt, &root))
+    }
 }
 
 pub struct RunDir(pub PathBuf);

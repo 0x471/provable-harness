@@ -20,7 +20,6 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ph_core::hash::{from_hex32, to_hex, Digest};
-use ph_core::protocol::context_hash;
 use ph_core::{
     Claim, ModelAuth, Outcome, Role, SessionInput, TlsRoots, ToolAuth, ToolTlsConfig, Witness,
     ZkTlsConfig,
@@ -29,7 +28,7 @@ use sha2::{Digest as _, Sha256};
 use sp1_sdk::SP1ProofWithPublicValues;
 
 use crate::prover::ProofMode;
-use crate::scenario::{load_public_key, load_signing_key, RunDir, Scenario, Transcript};
+use crate::scenario::{load_public_key, load_signing_key, FinalWorkspace, RunDir, Scenario, Transcript};
 use crate::services::{ModelProvider, Services};
 
 #[derive(Parser)]
@@ -365,17 +364,11 @@ fn cmd_run(
     fs::write(rd.claim(), output.claim.pretty())?;
     fs::write(
         rd.transcript(),
-        serde_json::to_string_pretty(&Transcript {
-            session_id: to_hex(&input.session_id),
-            model_id: input.model_id.clone(),
-            system_prompt: input.system_prompt.clone(),
-            tools: input.tool_mode.tools_json(),
-            messages: output.messages.clone(),
-        })?,
+        serde_json::to_string_pretty(&Transcript::new(&input, &output, &witness.blind))?,
     )?;
     fs::write(
         rd.final_workspace(),
-        serde_json::to_string_pretty(&output.final_workspace)?,
+        serde_json::to_string_pretty(&FinalWorkspace::new(&output, &witness.blind))?,
     )?;
     write_actions(out, &output, &witness.blind)?;
     print_transcript(&output.messages);
@@ -592,11 +585,8 @@ fn cmd_verify(run: &Path, scenario: &Scenario, keys: &Path, x: &Expect<'_>) -> R
     }
     match fs::read_to_string(rd.final_workspace()) {
         Ok(text) => {
-            let files: Vec<ph_core::WorkspaceFile> = serde_json::from_str(&text)?;
-            let root = ph_core::workspace::Workspace::new(&files)
-                .map_err(|e| anyhow!("final_workspace.json: {e}"))?
-                .root();
-            checks.push(eq_check("disclosed final workspace", &root, &claim.final_workspace_root));
+            let fw: FinalWorkspace = serde_json::from_str(&text)?;
+            checks.push(eq_check("disclosed final workspace", &fw.commitment()?, &claim.final_workspace_root));
         }
         Err(_) => warnings.push("no final_workspace.json disclosed; only its root is proven".into()),
     }
@@ -617,9 +607,9 @@ fn cmd_verify(run: &Path, scenario: &Scenario, keys: &Path, x: &Expect<'_>) -> R
     }
     if check_transcript {
         let t: Transcript = serde_json::from_str(&fs::read_to_string(rd.transcript())?)?;
-        let sid = from_hex32(&t.session_id).ok_or_else(|| anyhow!("bad session id in transcript"))?;
-        let h = context_hash(&sid, &t.model_id, &t.system_prompt, &t.tools, &t.messages);
-        checks.push(eq_check("disclosed transcript", &h, &claim.transcript_hash));
+        for (name, ok, detail) in t.check(&claim)? {
+            checks.push(Check { name, ok, detail });
+        }
     }
 
     let mut all_ok = true;

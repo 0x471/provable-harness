@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::claim::{Claim, Outcome, CLAIM_VERSION};
+use crate::claim::{claim_salt, salted, Claim, Outcome, CLAIM_VERSION, SALT_FINAL_ANSWER, SALT_FINAL_WORKSPACE, SALT_TRANSCRIPT};
 use crate::hash::{text_hash, Digest};
 use crate::policy::Policy;
 use crate::protocol::{context_append, context_genesis, model_request_hash, Message, ModelQuery, Role};
@@ -69,8 +69,32 @@ pub fn extract_script(text: &str) -> Option<&str> {
     Some(&body[..end])
 }
 
+/// The final answer of a session, recomputed from its messages: what the claim
+/// commits to in `final_answer_hash`. Used to check a disclosed transcript.
+pub fn final_answer_of(messages: &[Message], outcome: Outcome) -> String {
+    if outcome != Outcome::Completed {
+        return String::new();
+    }
+    match messages.last() {
+        Some(m) if m.role == Role::Assistant => m.content.clone(),
+        Some(m) if m.role == Role::AssistantBlocks => crate::anthropic::blocks_of(&m.content)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::anthropic::Block::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Run a session. `blind` is a private per-run seed (random in live runs,
-/// carried in the witness) that salts the action log's commitments.
+/// carried in the witness) that salts the action log's and the claim's
+/// commitments to private data.
 pub fn run_session(
     input: &SessionInput,
     blind: &crate::hash::Digest,
@@ -248,11 +272,11 @@ pub fn run_session(
         system_prompt_hash: text_hash(&input.system_prompt),
         task_hash: text_hash(&input.task),
         initial_workspace_root,
-        final_workspace_root: env.workspace.root(),
-        transcript_hash: ctx,
+        final_workspace_root: salted(&claim_salt(blind, SALT_FINAL_WORKSPACE), &env.workspace.root()),
+        transcript_hash: salted(&claim_salt(blind, SALT_TRANSCRIPT), &ctx),
         action_log_hash: env.action_log,
         outcome,
-        final_answer_hash: text_hash(&final_answer),
+        final_answer_hash: salted(&claim_salt(blind, SALT_FINAL_ANSWER), &text_hash(&final_answer)),
         final_answer: (!env.tainted).then_some(final_answer),
         steps,
         scripts,
@@ -282,5 +306,20 @@ mod tests {
         assert_eq!(extract_script("```rhai\n```"), Some(""));
         assert_eq!(extract_script("```rhai\nlet a = 1;"), Some("let a = 1;"));
         assert_eq!(extract_script("```js\nfoo()\n```"), None);
+    }
+
+    #[test]
+    fn final_answer_from_messages() {
+        use super::final_answer_of;
+        use crate::anthropic::{blocks_json, Block};
+        use crate::claim::Outcome;
+        use crate::protocol::{Message, Role};
+        let m = |role, content: &str| Message { role, content: content.to_string() };
+        let code = [m(Role::User, "t"), m(Role::Assistant, "done")];
+        assert_eq!(final_answer_of(&code, Outcome::Completed), "done");
+        assert_eq!(final_answer_of(&code, Outcome::StepLimit), "");
+        let blocks = blocks_json(&[Block::Text("a".into()), Block::Text("b".into())]);
+        let native = [m(Role::User, "t"), m(Role::AssistantBlocks, &blocks)];
+        assert_eq!(final_answer_of(&native, Outcome::Completed), "ab");
     }
 }

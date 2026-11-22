@@ -9,6 +9,8 @@ use std::rc::Rc;
 
 use ed25519_dalek::SigningKey;
 use ph_core::protocol::{model_attestation_digest, model_response_hash, tool_attestation_digest};
+use ph_core::claim::{claim_salt, salted, SALT_FINAL_ANSWER, SALT_TRANSCRIPT};
+use ph_core::session::final_answer_of;
 use ph_core::witness::sign_digest;
 use ph_core::{
     verify_witness, HarnessError, ModelAuth, ModelBackend, ModelEvidence, ModelQuery, Outcome,
@@ -211,7 +213,12 @@ fn honest_injection_run_replays_and_blocks_exfiltration() {
     assert_eq!(c.outcome, Outcome::Completed);
     // Tainted session: the final message is withheld from the public claim.
     assert_eq!(c.final_answer, None);
-    assert_eq!(c.final_answer_hash, ph_core::hash::text_hash("Report written to /out/report.md."));
+    // Its hash is salted: the answer cannot be confirmed from the claim alone.
+    let answer = ph_core::hash::text_hash("Report written to /out/report.md.");
+    assert_ne!(c.final_answer_hash, answer);
+    let salt = claim_salt(&w.blind, SALT_FINAL_ANSWER);
+    assert_eq!(c.final_answer_hash, salted(&salt, &answer));
+    assert_eq!(final_answer_of(&replay.messages, c.outcome), "Report written to /out/report.md.");
     assert_eq!(c.steps, 3);
     assert_eq!(c.scripts, 2);
     assert!(c.tainted);
@@ -247,7 +254,9 @@ fn transcript_hash_matches_disclosed_messages() {
         "",
         &live.messages,
     );
-    assert_eq!(h, live.claim.transcript_hash);
+    assert_ne!(h, live.claim.transcript_hash, "the commitment is salted");
+    let salt = claim_salt(&w.blind, SALT_TRANSCRIPT);
+    assert_eq!(salted(&salt, &h), live.claim.transcript_hash);
 }
 
 #[test]
