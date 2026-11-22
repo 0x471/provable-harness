@@ -282,6 +282,7 @@ impl ServerCertVerifier for WebPkiVerifier {
         let time = pki_types::UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?);
 
         cert.verify_for_usage(
+            // [ph fork] RustCrypto algorithms instead of ring's.
             ph_webpki_algs::ALL_VERIFICATION_ALGS,
             &self.roots.roots,
             &intermediates,

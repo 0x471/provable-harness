@@ -1,4 +1,4 @@
-# Verify-only fork of TLSNotary v0.1.0-beta.1 (see PATCHES.md, UPSTREAM_COMMIT).
+# Verify-only fork of TLSNotary v0.1.0-beta.1 (see PATCHES.md).
 # Used by ph-core to verify TLSNotary presentations natively and inside the SP1 guest.
 [workspace]
 resolver = "2"
