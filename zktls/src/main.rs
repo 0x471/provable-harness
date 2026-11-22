@@ -59,6 +59,9 @@ enum Cmd {
         /// the notary can burn slots of a session whose id they know.
         #[arg(long)]
         operator_tokens: Option<PathBuf>,
+        /// Serve without --operator-tokens on a non-loopback address.
+        #[arg(long)]
+        open: bool,
         /// Concurrent MPC-TLS sessions (more are refused with REFUSED busy).
         #[arg(long, default_value_t = 8)]
         max_sessions: usize,
@@ -414,17 +417,23 @@ fn main() -> Result<()> {
             addr,
             ca,
             operator_tokens,
+            open,
             max_sessions,
         } => {
             let secret = read_key(&key)?;
-            let state = NotaryState::open(&state, &notary_public_key(&secret)?)?;
             let access = match &operator_tokens {
                 Some(p) => NotaryAccess::from_file(p)?,
                 None => {
+                    let host = addr.rsplit_once(':').map_or(addr.as_str(), |(h, _)| h);
+                    let loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]");
+                    if !loopback && !open {
+                        bail!("{addr} is not a loopback address: give --operator-tokens (or --open to let anyone burn slots)");
+                    }
                     eprintln!("[notary] WARNING: no --operator-tokens; anyone who can connect may request slots");
                     NotaryAccess::open()
                 }
             };
+            let state = NotaryState::open(&state, &notary_public_key(&secret)?)?;
             rt.block_on(run_notary(addr, secret, roots(&ca)?, state, access, max_sessions))?;
         }
         Cmd::SessionLog {
