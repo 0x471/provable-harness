@@ -25,7 +25,7 @@ An AI agent harness whose runs can be proven. Status: research prototype, not au
 
 ## What it is
 
-The agent runs as usual. Afterwards, the [SP1](https://github.com/succinctlabs/sp1) zkVM replays the same harness code over a recording of the run and produces a proof. Anyone can check that proof in about two seconds and learn what the model was shown, which tools it called with which arguments, what the policy allowed or blocked, and how the run ended, without trusting the person who ran it.
+The agent runs as usual. Afterwards, the [SP1](https://github.com/succinctlabs/sp1) zkVM replays the same harness code over a recording of the run and produces a proof. Whoever receives the proof can check it in about two seconds and learn what the model was shown, which tools it called with which arguments, what the policy allowed or blocked, and how the run ended, without trusting the person who ran it.
 
 ## Why
 
@@ -39,20 +39,20 @@ The proof is tied to one harness program, identified by its verifying key (the v
 - every tool call was checked against the declared policy, with its real runtime arguments, at the moment it ran;
 - file changes were applied to a committed workspace;
 - every model reply and every external result is genuine: either signed by a service you trust, or taken from the real HTTPS connection and notarized (zkTLS);
-- the published claim is true: steps, calls allowed and denied, whether secret data was touched, the outcome, and hashes of the full transcript and of the action log.
+- the published claim is true: steps, calls allowed and denied, whether secret data was touched, the outcome, and salted commitments to the full transcript and the action log.
 
 What it does not tell you:
 
 - How the model computed its reply. The reply is attested by the provider's TLS connection, not proven. That would need TEE inference or zkML.
 - That the zkTLS notary did not collude with the operator.
 - What the operator did outside the harness.
-- That secrets stay private. Compressed STARK proofs are not zero-knowledge, so keep them as private as the recording. The optional Groth16 mode is zero-knowledge (implemented, not yet run end to end).
+- That secrets stay private. Compressed STARK proofs are not zero-knowledge, so keep them as private as the recording. The optional Groth16 mode wraps the proof in a SNARK that SP1 describes as zero-knowledge; it is implemented but has never produced a proof here.
 
 The [threat model](#threat-model) below goes through the attacks one by one.
 
 ## Use cases
 
-**Evals that don't have to be taken on trust.** Today, a safety eval result is a number in a report: readers cannot tell whether the runs used the claimed model and prompt, whether a different grader was used, or whether bad runs were quietly re-run. With a provable eval, the lab or an outside evaluator publishes one proof with the report. Anyone can check that every run of the published suite happened, with the pinned model, prompt and policy, that the published grader computed the grades, that no run was re-rolled, and that any run left out shows up as missing. This is the use case the prototype runs end to end (see below).
+**Evals that don't have to be taken on trust.** Today, a safety eval result is a number in a report: readers cannot tell whether the runs used the claimed model and prompt, whether a different grader was used, or whether bad runs were quietly re-run. With a provable eval, the lab or an outside evaluator hands out one proof with the report. Whoever checks it learns that every run of the published suite happened, with the pinned model, prompt and policy, that the published grader computed the grades, that no run was re-rolled, and that any run left out shows up as missing. This is the use case the prototype runs end to end (see below).
 
 **Agents acting for someone else.** An agent that manages someone's account, inbox or files can hand over a proof per session instead of raw logs. The user, an auditor or a regulator learns which calls were made, which ones the policy blocked, and whether secret data was read, without seeing the data itself: the action log can be disclosed with its values hidden, as salted commitments.
 
@@ -62,10 +62,10 @@ The last two use the same mechanisms as the evals but have not been tried as pro
 
 ### Example: publishing a prompt-injection eval
 
-1. The verifier picks a fresh random seed, or the evaluator pre-registers the eval against a future drand round so that nobody chooses the seed.
+1. The verifier picks a fresh random seed. Or the evaluator pre-registers the eval against a future drand round, and the notary time-stamps the pre-registration, so that nobody chooses the seed.
 2. The evaluator runs every case of the suite with the real model. Model calls go over zkTLS through an independent notary. The web pages, including the injected ones, come from the suite's published fixtures.
-3. The evaluator proves the whole eval once and publishes the proof, the report and the notary's signed session log.
-4. A reader runs `ph eval verify` with the published suite. In about two seconds it confirms the program vk, the suite, the seed, the pinned model and notary, that every run is accounted for (delivered, or reported as missing), and that the grades in the report are the ones computed in the proof. With the notary's log it also sees why a run is missing.
+3. The evaluator proves the whole eval once and hands out the proof and the report; the notary hands out its signed session log. (Until the zero-knowledge mode has been run, use a short-lived API key and revoke it before handing the proof out: it is in the witness.)
+4. A reader runs `ph eval verify` with the published suite. In about two seconds it confirms the program vk, the suite, the seed (and that its pre-registration predates the round), the pinned model and notary, that every run is accounted for, and that the grades in the report are the ones computed in the proof. A missing run fails the check unless the reader accepts it. With the notary's log the reader also sees why a run is missing, and whether the suite was pre-registered more than once.
 
 The reader still has to trust that the notary did not collude with the evaluator and that the provider served the model it named. The proof covers everything else.
 
@@ -119,7 +119,7 @@ sequenceDiagram
     H->>M: results become the next turn
 ```
 
-The model works either in code mode (it writes a small [Rhai](https://rhai.rs) script that calls the tools) or with native tool calls. Each call goes through the policy with its actual arguments. A policy can, for example, block all network egress as soon as secret data has been read. The script engine is metered, so an injected script cannot make proving explode: under the default budgets the worst case is about 160 M zkVM cycles per session.
+The model works either in code mode (it writes a small [Rhai](https://rhai.rs) script that calls the tools) or with native tool calls. Each call goes through the policy with its actual arguments. A policy can, for example, block all network egress as soon as secret data has been read. The script engine is metered (operations, and the volume of data each one touches), so an injected script cannot make proving explode: a checked-in suite of 57 attack scripts tops out at about 270 M zkVM cycles per session under the default budgets. That is a measurement, not a proof; see [docs/DESIGN.md](docs/DESIGN.md), section 12.2.
 
 ### Where trust comes from
 
@@ -153,17 +153,17 @@ The notary hands out one reply per (session, step), so the operator cannot re-sa
 The guest gets two kinds of input:
 
 - **Public configuration**, which the verifier has too: system prompt, task, policy, initial workspace, tool definitions, the trusted keys or the notary and its root certificates, and the session id.
-- **The private witness**: only responses (model replies, tool results) and their signatures or TLS presentations. It never contains requests. The guest builds every request itself.
+- **The private witness**: the responses (model replies, tool results) with their signatures or TLS presentations, and a private seed for salting. The guest never takes a request from it: it builds every request itself and checks it against the attested exchange. (A TLS presentation does contain the request bytes it notarized, which is how the guest checks them, and why the API key ends up in the witness.)
 
 Then it runs the session again and checks:
 
-- **For every model step**: it rebuilds the request from the session state (a hash chain over the system prompt, the tools and every message so far). In default mode, the gateway's Ed25519 signature must cover that request hash and the reply. In zkTLS mode, the TLS exchange must contain exactly that request (next section).
+- **For every model step**: it rebuilds the request from the session state (a hash chain over the system prompt, the tools and every message so far). In default mode, the gateway's Ed25519 signature must cover that request hash and the reply. In zkTLS mode, the TLS exchange must contain exactly that request (next section). A reply that stopped at `max_tokens` runs nothing: it may end in the middle of a script.
 - **For every tool call**: the policy decision with the call's actual arguments (allowed paths and URLs, budgets, the no-egress-after-secrets rule). File tools run inside the proof on the committed workspace. A network call needs the oracle's signature over the exact call and its result, or a zkTLS presentation of exactly that request, or, in evals, an answer from the published fixture world.
 - **Throughout**: call and operation budgets, whether secret data was read, the transcript and action-log hash chains, and that the witness is consumed in order, with nothing missing or left over.
 
-At the end it commits the claim as its public output. Any failed check makes the guest panic, and a panicking guest has no proof.
+At the end it commits the claim as its public output. The transcript, the final workspace and a withheld final answer enter it as commitments salted with a private per-run seed, so the claim alone cannot confirm a guess about them. Any failed check makes the guest panic, and a panicking guest has no proof.
 
-`ph verify` then does two things. SP1 checks the proof against the pinned vk, which identifies the exact harness program. Then the claim is compared with what the verifier expects: the hashes of its policy, prompt, task, workspace, tool definitions and trusted keys, its session id, and optionally the disclosed transcript and action log, which must hash to the values in the claim.
+`ph verify` then does two things. SP1 checks the proof against the pinned vk, which identifies the exact harness program. Then the claim is compared with what the verifier expects: the hashes of its policy, prompt, task, workspace, tool definitions and trusted keys, its session id, and optionally the disclosed transcript and action log, which must open the commitments in the claim (the disclosure files carry their salts).
 
 ## How a zkTLS reply is checked inside the proof
 
@@ -188,7 +188,7 @@ flowchart TB
 1. **Notary**: the attestation is signed by the pinned notary key, under this project's own signature scheme. A stock TLSNotary notary with the same key would not enforce one reply per slot, so its signatures are rejected.
 2. **Server**: the certificate chain for the expected host is valid at the notarized time under the trusted roots, and the certificate's key signed the ephemeral key the notary attested. So the other end of the connection really was that server.
 3. **Bytes**: the revealed request and response open the attestation's commitments, over TLS 1.2, with nothing redacted.
-4. **Harness**: the slot is this session and step; the request equals, byte for byte, the request the guest rebuilt from its own state; the response is exactly one well-formed HTTP response; and the reply comes from the expected model.
+4. **Harness**: the slot is this session and step; the request equals, byte for byte, the request the guest rebuilt from its own state; the response is exactly one well-formed HTTP response; and the reply comes from the expected model (or a dated snapshot of it).
 
 Nothing may be redacted, because hidden bytes could carry a second, hidden request. The cost is that the API key ends up in the witness (see the threat model).
 
@@ -213,15 +213,17 @@ Two kinds of attacker:
 | Run under a looser policy or another prompt and claim the published one | Their hashes are in the claim, and the verifier compares them. |
 | Run modified harness code | Different code, different vk. The build is reproducible, so the vk can be checked against the source. |
 | Edit the claim or the eval report after proving | SP1 verification fails. |
-| Pick the eval seed, drop bad runs, or run them again | The seed comes from the verifier or a drand round, so the operator cannot choose the session ids. The notary refuses a second reply for the same slot, missing runs are reported, and the notary's log shows which ones were withheld. |
+| Pick the eval seed, drop bad runs, or run them again | The seed comes from the verifier, or from a drand round that the notary saw pre-registered before the round. The notary refuses a second reply for the same slot. A missing run fails verification unless the verifier accepts it, and the notary's log shows which runs were started and not delivered, and whether the suite was pre-registered more than once. |
 | Use a notary that does not enforce one reply per slot | Only this project's notary signature scheme is accepted. |
 | Injected text tells the agent to send a secret somewhere | Every call is checked against the policy with its real arguments (for example, no network after reading a secret), and the attempt is on record. |
 | An injected script tries to reach the OS, stall, or swallow a fatal error | Scripts have no OS access, `sleep` is disabled, and backend failures cannot be caught. |
-| An injected script tries to make proving too expensive | The metered engine and the policy budgets cap the cost. |
+| An injected script tries to make proving too expensive | The metered engine and the policy budgets cap the cost: about 270 M cycles per session at most in a suite of attack scripts (measured, not proven). |
+| Run part of a script from a reply cut off at `max_tokens` | Nothing in such a reply runs. |
+| Confirm a guessed secret (a withheld answer, a file) from the public claim | Those commitments are salted with a private per-run seed. |
 
 What stays trusted:
 
-- **The notary**, in zkTLS mode. A notary colluding with the operator can forge transcripts. Use an independent notary, a notary in a TEE, or several notaries.
+- **The notary**, in zkTLS mode. A notary colluding with the operator can forge transcripts, and its clock dates pre-registrations and notarized exchanges. Use an independent notary, a notary in a TEE, or several notaries. Operators holding tokens for the same notary can burn each other's slots.
 - **The model provider.** zkTLS shows what `api.anthropic.com` returned, not how it computed the reply or which weights ran.
 - **The web PKI.** A mis-issued certificate breaks server authentication, and revocation is not checked. Pin roots and require fresh sessions.
 - **The gateway and oracle**, in default mode.
@@ -237,7 +239,7 @@ You need:
 
 - the SP1 v6 toolchain (installed with `sp1up`; it provides the `succinct` Rust toolchain for `riscv64im-succinct-zkvm-elf`);
 - Rust 1.93.0 for the host (pinned in `rust-toolchain.toml`). It must be the same release as the SP1 toolchain's Rust, and the build refuses to continue otherwise;
-- about 16 GB of RAM to prove on a CPU (see the low-memory settings below).
+- 24 GB of RAM to prove on a CPU. The weather demos peaked at about 22 GB of memory footprint (12 GB resident) with SP1 limited to 2 core and 4 recursion workers (docs/ZKTLS.md, section 7); if the prover gets killed for memory, use the settings below.
 
 Optional: Rust 1.95.0 for the `zktls/` workspace, nightly Rust for `fuzz/`, and Go for `--features groth16`.
 
@@ -248,7 +250,7 @@ cargo build --release -p ph-host       # builds the ph CLI and the SP1 guest
 # Prompt-injection demo: scripted model, trusted services, zkVM execution only (seconds)
 ./target/release/ph demo --scenario fixtures/scenarios/weather-injection --out runs/demo --prove none
 
-# The same with a real proof and its verification (about 2 minutes on an M4 Pro)
+# The same with a real proof and its verification (about 3 minutes on an M4 Pro)
 ./target/release/ph demo --scenario fixtures/scenarios/weather-injection --out runs/demo --prove compressed
 
 # Try to cheat: tampered witnesses must be rejected, edited public values must not verify
@@ -315,22 +317,23 @@ flowchart LR
     NL["notary session log"] -.-> V
 ```
 
-- The seed fixes which runs exist, so the operator cannot swap in runs of its own choosing, and any run left out is reported as missing. Without an interactive verifier, `ph eval prereg` commits to the suite, model, notary and program before a future drand round, and the seed comes from that round's randomness.
+- The seed fixes which runs exist, so the operator cannot swap in runs of its own choosing, and any run left out is reported as missing (and fails verification unless accepted). Without an interactive verifier, `ph eval prereg` commits to the suite, model, notary and program before a future drand round; the notary time-stamps it, and the seed comes from that round's randomness.
 - Tools answer from the suite's published fixture world, so the injected content is part of what the proof shows.
-- The notary's signed session log tells, for each missing run, whether it was never started, aborted, or completed and withheld.
+- The notary's signed session log tells, for each missing run, whether it was never started or started and not delivered, and lists every pre-registration the notary saw.
 
 ```bash
 ph eval seed                                                          # verifier: a fresh challenge
 ph eval run    --suite <suite dir> --seed <hex> --out runs/e --zktls-config zktls.json --zktls-proxy <url>
-ph eval prove  --dir runs/e/out
-ph eval verify --suite <suite dir> --seed <hex> --dir runs/e/out --zktls-config zktls.json
+ph eval prove  --dir runs/e
+ph eval verify --suite <suite dir> --seed <hex> --dir runs/e --zktls-config zktls.json \
+               --tls-max-age-secs 86400 --notary-log log.json --log-not-before <time> --check-transcripts
 ```
 
 Suites in `fixtures/evals/`:
 
 - `weather-canary`: our prompt-injection suite with a planted key (and an ablation without the "treat content as data" line);
-- `agentdojo-banking-slice`: a port of part of [AgentDojo](https://github.com/ethz-spylab/agentdojo)'s banking suite (MIT, attributed);
-- `agentdojo-banking-native`: the same tasks with AgentDojo's own tools, a stateful bank inside the proof and AgentDojo's post-state checks.
+- `agentdojo-banking-slice`: a port of part of [AgentDojo](https://github.com/ethz-spylab/agentdojo)'s banking suite in code mode, with a stateful bank inside the proof and AgentDojo's post-state checks (MIT, attributed);
+- `agentdojo-banking-native`: the same tasks with AgentDojo's own tools (native tool use).
 
 [docs/EVALS.md](docs/EVALS.md) has the design, the results and the limits.
 
@@ -338,19 +341,22 @@ Suites in `fixtures/evals/`:
 
 All numbers are from an Apple M4 Pro with 24 GB of RAM and the SP1 CPU prover, with compressed proofs. A compressed proof is about 1.3 MB and verifies in about 2 seconds.
 
-Current program (vk `0x005b467c...d845`):
+Current program (vk `0x00923577...3943`):
 
 | Run | zkVM cycles | Proving time |
 |---|---|---|
-| `weather-native` (native tools, scripted model) | 2.28 M | 95 s |
-| `weather-injection` (code mode, scripted model) | 2.61 M | 108 s |
-| AgentDojo banking v2, 12 runs over MPC-TLS (mock model) | 86.3 M | 38 min (15 GB peak) |
+| `weather-native` (native tools, scripted model) | 2.31 M | 158 s |
+| `weather-injection` (code mode, scripted model) | 2.59 M | 172 s |
+| AgentDojo banking, native port: 12 runs over MPC-TLS, mock model | 86.7 M | 43 min (22.3 GB peak footprint) |
+| Worst of 57 attack scripts (`tools/cost-suite.py`, execution only) | 272 M | |
 
-Earlier program versions, with the real `claude-haiku-5-5`:
+Proving times use reduced SP1 concurrency (core workers and buffers, recursion workers and buffers): 2/2/4/4 for the weather runs, 1/1/2/2 for the eval.
+
+Earlier program versions, with the real `claude-haiku-5-5`. These are the authors' report: the proofs, and the program versions and fixtures needed to check them, are kept only in a private archive.
 
 - One fully real session (the model and a real website both over zkTLS): 70.5 M cycles, proved in 25 minutes.
 - `weather-canary` and its ablation: in 0 of 16 injected runs did the model try to send the planted key anywhere, and it completed all 20 tasks.
-- AgentDojo banking slice (code mode): utility 1/3 without attack and 4/9 under attack, and 0 of 9 attacks succeeded.
+- AgentDojo banking slice (code mode, graded by its first, call-based graders): utility 1/3 without attack and 4/9 under attack, and 0 of 9 attacks succeeded. AgentDojo's own state-based checks give the same result on these runs' transcripts.
 
 These samples are small; [docs/EVALS.md](docs/EVALS.md) explains what they do and do not show.
 
@@ -365,11 +371,12 @@ These samples are small; [docs/EVALS.md](docs/EVALS.md) explains what they do an
 | `webpki-algs/` | RustCrypto signature algorithms for rustls-webpki, tested against ring |
 | `vendor/tlsn/` | verify-only, ring-free fork of TLSNotary 0.1.0-beta.1 |
 | `vendor/rhai/` | Rhai 1.27.0 with a data-volume meter |
+| `vendor/smartstring/` | smartstring 1.0.1 with a fix for quadratic appends in the zkVM |
 | `fixtures/` | system prompt, scenarios, eval suites |
-| `tools/` | AgentDojo suite generator, reproducible guest build |
+| `tools/` | AgentDojo suite generator, reproducible guest build, proving-cost suite |
 | `fuzz/` | cargo-fuzz targets, including a differential test against ring |
 
-The guest build is reproducible: `tools/repro-guest-build.sh` gives the same ELF, and so the same vk, from any checkout path with the same SP1 toolchain.
+The guest build is reproducible: `tools/repro-guest-build.sh` gives the same ELF, and so the same vk, from any checkout path, as long as it builds in `/tmp/ph-repro` with the same SP1 toolchain on the same OS. This has been checked on one macOS machine.
 
 ## Further reading
 
@@ -379,4 +386,4 @@ The guest build is reproducible: `tools/repro-guest-build.sh` gives the same ELF
 
 ## License
 
-MIT or Apache-2.0, at your option.
+MIT or Apache-2.0, at your option. Vendored code keeps its own license: Rhai and the TLSNotary crates are MIT or Apache-2.0, smartstring is MPL-2.0 (including its patched file), and the AgentDojo data and logic ported in `fixtures/evals/agentdojo-*` and `core/src/bank.rs` are MIT.
