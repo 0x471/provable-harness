@@ -59,6 +59,12 @@ enum EvalCmd {
         /// How far in the future the beacon round is.
         #[arg(long, default_value_t = 600)]
         delay_secs: u64,
+        /// Address of the pinned notary, which time-stamps the pre-registration.
+        #[arg(long)]
+        notary: String,
+        /// Environment variable holding the notary operator token, if it needs one.
+        #[arg(long)]
+        notary_token_env: Option<String>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -802,24 +808,35 @@ fn main() -> Result<()> {
                 }
                 println!("{}", to_hex(&seed));
             }
-            EvalCmd::Prereg { suite, zktls_config, delay_secs, out } => {
+            EvalCmd::Prereg { suite, zktls_config, delay_secs, notary, notary_token_env, out } => {
                 let s = eval_cmd::load_suite(&suite)?;
                 let config = load_zktls_config(&zktls_config)?;
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
                 let round = beacon::round_at(now + delay_secs) + 1;
-                let p = beacon::Prereg {
+                let mut p = beacon::Prereg {
                     suite_name: s.name.clone(),
                     suite_hash: to_hex(&s.hash()),
                     model_id: config.model.clone(),
-                    model_auth_hash: to_hex(&ModelAuth::ZkTls(config).hash()),
+                    model_auth_hash: to_hex(&ModelAuth::ZkTls(config.clone()).hash()),
                     program_vk: prover::vk_hash()?,
                     beacon_chain: beacon::QUICKNET_CHAIN.into(),
                     beacon_round: round,
                     beacon_time: beacon::round_time(round),
+                    receipt: None,
                 };
+                let token = match &notary_token_env {
+                    Some(var) => Some(std::env::var(var).with_context(|| format!("${var} is not set"))?),
+                    None => None,
+                };
+                let receipt = beacon::notarize_prereg(&notary, token.as_deref(), &p)?;
+                receipt.verify(&p, &config.notary).context("the notary's receipt")?;
+                if receipt.time >= p.beacon_time {
+                    bail!("the notary time-stamped it at {}, not before round {round} (at {})", receipt.time, p.beacon_time);
+                }
+                p.receipt = Some(receipt);
                 fs::write(&out, serde_json::to_string_pretty(&p)?)?;
                 println!(
-                    "pre-registration {} written to {}: drand quicknet round {round} (at unix {}). Publish it before then.",
+                    "pre-registration {} time-stamped by the notary, written to {}: drand quicknet round {round} (at unix {}).",
                     to_hex(&p.hash()),
                     out.display(),
                     p.beacon_time

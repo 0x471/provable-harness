@@ -14,10 +14,11 @@
 //!    every notarized TLS time is after round R was published (the runs
 //!    happened after the seed existed).
 //!
-//! What this cannot show: that the pre-registration was public before round R.
-//! Publish it somewhere with a trusted timestamp (a public repository, a
-//! transparency log); a verifier should accept only pre-registrations they saw,
-//! or whose timestamp predates round R.
+//! The pinned notary time-stamps the pre-registration (`PH-PREREG`): it journals
+//! it and signs a receipt, which `ph eval verify` requires to predate round R.
+//! The notary's session log lists every pre-registration it saw, so with
+//! `--notary-log` a verifier also sees whether the operator pre-registered the
+//! same suite more than once and kept the round it liked (seed shopping).
 
 use anyhow::{anyhow, bail, Context, Result};
 use drand_verify::{derive_randomness, G2PubkeyRfc, Pubkey};
@@ -51,6 +52,50 @@ pub struct Prereg {
     pub beacon_round: u64,
     /// Earliest time the beacon round can exist (unix seconds).
     pub beacon_time: u64,
+    /// The notary's time-stamp; not part of `hash()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<PreregReceipt>,
+}
+
+/// A notary-signed time-stamp of a pre-registration.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreregReceipt {
+    /// Notary clock (unix seconds).
+    pub time: u64,
+    /// k256 ECDSA signature (hex) over `ph_core::notary_log::prereg_receipt_digest`.
+    pub signature: String,
+}
+
+impl PreregReceipt {
+    /// Check the receipt for `p` against the pinned notary key.
+    pub fn verify(&self, p: &Prereg, notary: &ph_core::NotaryKey) -> Result<()> {
+        let suite = ph_core::hash::from_hex32(&p.suite_hash).ok_or_else(|| anyhow!("bad suite hash"))?;
+        let sig = from_hex(&self.signature).ok_or_else(|| anyhow!("receipt signature is not hex"))?;
+        ph_core::notary_log::verify_prereg_receipt(notary, &suite, &p.hash(), self.time, &sig).map_err(|e| anyhow!(e))
+    }
+}
+
+/// Ask the notary at `addr` to time-stamp a pre-registration.
+pub fn notarize_prereg(addr: &str, token: Option<&str>, p: &Prereg) -> Result<PreregReceipt> {
+    use std::io::{BufRead, Write};
+    let mut s = std::net::TcpStream::connect(addr).with_context(|| format!("connecting to the notary at {addr}"))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let mut msg = String::new();
+    if let Some(t) = token {
+        msg.push_str(&format!("PH-AUTH {t}\n"));
+    }
+    msg.push_str(&format!("PH-PREREG {} {}\n", p.suite_hash, to_hex(&p.hash())));
+    s.write_all(msg.as_bytes())?;
+    let mut line = String::new();
+    std::io::BufReader::new(&s).read_line(&mut line)?;
+    let mut it = line.trim_end().split(' ');
+    match (it.next(), it.next(), it.next(), it.next()) {
+        (Some("OK"), Some(time), Some(sig), None) => Ok(PreregReceipt {
+            time: time.parse().context("receipt time")?,
+            signature: sig.to_string(),
+        }),
+        _ => bail!("notary: {}", line.trim_end()),
+    }
 }
 
 impl Prereg {
@@ -155,8 +200,13 @@ mod tests {
             beacon_chain: QUICKNET_CHAIN.into(),
             beacon_round: 34165327,
             beacon_time: round_time(34165327),
+            receipt: None,
         };
         let s = seed_from(&p, &real()).unwrap();
+        // The notary's receipt is not part of what it time-stamps.
+        let mut r = p.clone();
+        r.receipt = Some(PreregReceipt { time: 1, signature: "00".into() });
+        assert_eq!(r.hash(), p.hash());
         let mut q = p.clone();
         q.suite_hash = "01".repeat(32);
         assert_ne!(seed_from(&q, &real()).unwrap(), s);
