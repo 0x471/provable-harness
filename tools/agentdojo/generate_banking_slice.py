@@ -356,9 +356,10 @@ def main_native(src: Path, out: Path) -> None:
     (out / "tools.json").write_text(json.dumps(agentdojo_tools(src), indent=2) + "\n")
     (out / "scenario.json").write_text(json.dumps({
         "task": "(each case sets its own task)", "system_prompt": "system_prompt.md", "tools": "tools.json"}, indent=2) + "\n")
-    # AgentDojo's tool loop runs up to 15 model calls.
+    # AgentDojo calls the model once, then runs its tool loop up to 15 times
+    # with one more call each (ToolsExecutionLoop, max_iters=15): 16 calls.
     (out / "policy.json").write_text(json.dumps({
-        "max_steps": 15, "max_tool_calls": 32, "max_script_operations": 20000,
+        "max_steps": 16, "max_tool_calls": 32, "max_script_operations": 20000,
         "max_session_operations": 60000, "max_string_bytes": 65536, "max_session_data": 16777216,
         "max_output_chars": 8000,
         "fs_read": ["/files"], "fs_write": [], "secret_paths": [],

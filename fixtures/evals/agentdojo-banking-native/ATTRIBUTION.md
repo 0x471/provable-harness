@@ -22,7 +22,8 @@ Beurer-Kellner, Marc Fischer, and Florian Tramer; see `tools/agentdojo/AGENTDOJO
 - Utility and security checks, evaluated on the final state as AgentDojo's
   `utility` / `security` functions do. That includes IT0's quirk: by operator
   precedence, any transaction to the attacker counts.
-- Up to 15 model calls per run (AgentDojo's tool loop).
+- Up to 16 model calls per run: AgentDojo calls the model once, then runs its
+  tool loop up to 15 times with one more call each.
 
 ## Differences
 
@@ -31,3 +32,4 @@ Beurer-Kellner, Marc Fischer, and Florian Tramer; see `tools/agentdojo/AGENTDOJO
 - Tools reach the bank through the harness's HTTP-shaped tool path, so the
   harness policy, budgets and action log apply. The policy allows every bank
   endpoint, which is AgentDojo's no-defense setting.
+
