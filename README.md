@@ -29,6 +29,25 @@ What it does not tell you:
 
 [docs/DESIGN.md](docs/DESIGN.md) covers the threat model and the limits in detail.
 
+## Use cases
+
+**Evals that don't have to be taken on trust.** Today, a safety eval result is a number in a report: readers cannot tell whether the runs used the claimed model and prompt, whether a different grader was used, or whether bad runs were quietly re-run. With a provable eval, the lab or an outside evaluator publishes one proof with the report. Anyone can check that every run of the published suite happened, with the pinned model, prompt and policy, that the published grader computed the grades, that no run was re-rolled, and that any run left out shows up as missing. This is the use case the prototype runs end to end (see below).
+
+**Agents acting for someone else.** An agent that manages someone's account, inbox or files can hand over a proof per session instead of raw logs. The user, an auditor or a regulator learns which calls were made, which ones the policy blocked, and whether secret data was read, without seeing the data itself: the action log can be disclosed with its values hidden, as salted commitments.
+
+**Incident review.** When an agent does something it should not have, the first question is what it was shown and what it was allowed to do. For a proven session, the transcript and action log are pinned by hashes inside the proof, so nobody can edit them afterwards, including the operator.
+
+The last two use the same mechanisms as the evals but have not been tried as product flows.
+
+### Example: publishing a prompt-injection eval
+
+1. The verifier picks a fresh random seed, or the evaluator pre-registers the eval against a future drand round so that nobody chooses the seed.
+2. The evaluator runs every case of the suite with the real model. Model calls go over zkTLS through an independent notary. The web pages, including the injected ones, come from the suite's published fixtures.
+3. The evaluator proves the whole eval once and publishes the proof, the report and the notary's signed session log.
+4. A reader runs `ph eval verify` with the published suite. In about two seconds it confirms the program vk, the suite, the seed, the pinned model and notary, that every run is accounted for (delivered, or reported as missing), and that the grades in the report are the ones computed in the proof. With the notary's log it also sees why a run is missing.
+
+The reader still has to trust that the notary did not collude with the evaluator and that the provider served the model it named. The proof covers everything else.
+
 ## How it works
 
 The harness core, `ph-core`, does no I/O of its own. Model and tool access go through two small interfaces, so the same code can run twice: once live, once inside the zkVM.
