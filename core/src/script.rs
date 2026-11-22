@@ -351,6 +351,10 @@ fn terminated() -> Box<EvalAltResult> {
     EvalAltResult::ErrorTerminated(Dynamic::UNIT, Position::NONE).into()
 }
 
+/// Longest script the harness compiles. Parsing is not metered, so its cost is
+/// bounded by the length.
+pub const MAX_SCRIPT_BYTES: usize = 32 * 1024;
+
 pub(crate) fn invoke(
     env: &Rc<RefCell<ToolEnv>>,
     tool: &'static str,
@@ -656,6 +660,15 @@ pub(crate) fn run_script(
         e.abort.set(false);
         e.ops.current.set(0);
         e.ops.script_exhausted.set(false);
+    }
+    if code.len() > MAX_SCRIPT_BYTES {
+        return Ok(ScriptReport {
+            error: Some(format!(
+                "script not run: it has {} bytes, the limit is {MAX_SCRIPT_BYTES}",
+                code.len()
+            )),
+            ..ScriptReport::default()
+        });
     }
     let res = engine.eval::<Dynamic>(code);
     let mut e = env.borrow_mut();
