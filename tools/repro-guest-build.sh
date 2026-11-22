@@ -16,7 +16,7 @@ mkdir -p "$BASE"
 BASE=$(cd "$BASE" && pwd -P)
 SRC="$BASE/src"
 mkdir -p "$SRC"
-for d in program core vendor/rhai vendor/tlsn webpki-algs; do
+for d in program core vendor/rhai vendor/smartstring vendor/tlsn webpki-algs; do
     mkdir -p "$SRC/$d"
     rsync -a --delete --exclude target "$ROOT/$d/" "$SRC/$d/"
 done

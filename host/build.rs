@@ -56,7 +56,7 @@ fn main() {
     let elf = field("elf ");
     println!("cargo:warning=ph-program ELF sha256 {}", field("elf_sha256 "));
     println!("cargo:rustc-env=SP1_ELF_ph-program={elf}");
-    for p in ["core", "program/src", "program/Cargo.toml", "program/Cargo.lock", "vendor/rhai", "vendor/tlsn", "webpki-algs", "tools/repro-guest-build.sh", "Cargo.toml"] {
+    for p in ["core", "program/src", "program/Cargo.toml", "program/Cargo.lock", "vendor/rhai", "vendor/smartstring", "vendor/tlsn", "webpki-algs", "tools/repro-guest-build.sh", "Cargo.toml"] {
         println!("cargo:rerun-if-changed={}", repo.join(p).display());
     }
     println!("cargo:rerun-if-env-changed=PH_REPRO_DIR");
