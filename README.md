@@ -136,13 +136,42 @@ The guest gets two kinds of input:
 
 Then it runs the session again and checks:
 
-- **For every model step**: it rebuilds the request from the session state (a hash chain over the system prompt, the tools and every message so far). In default mode, the gateway's Ed25519 signature must cover that request hash and the reply. In zkTLS mode, the TLS exchange must contain exactly that request (see docs/ZKTLS.md).
+- **For every model step**: it rebuilds the request from the session state (a hash chain over the system prompt, the tools and every message so far). In default mode, the gateway's Ed25519 signature must cover that request hash and the reply. In zkTLS mode, the TLS exchange must contain exactly that request (next section).
 - **For every tool call**: the policy decision with the call's actual arguments (allowed paths and URLs, budgets, the no-egress-after-secrets rule). File tools run inside the proof on the committed workspace. A network call needs the oracle's signature over the exact call and its result, or a zkTLS presentation of exactly that request, or, in evals, an answer from the published fixture world.
 - **Throughout**: call and operation budgets, whether secret data was read, the transcript and action-log hash chains, and that the witness is consumed in order, with nothing missing or left over.
 
 At the end it commits the claim as its public output. Any failed check makes the guest panic, and a panicking guest has no proof.
 
 `ph verify` then does two things. SP1 checks the proof against the pinned vk, which identifies the exact harness program. Then the claim is compared with what the verifier expects: the hashes of its policy, prompt, task, workspace, tool definitions and trusted keys, its session id, and optionally the disclosed transcript and action log, which must hash to the values in the claim.
+
+## How a zkTLS reply is checked inside the proof
+
+"zkTLS" here means [TLSNotary](https://tlsnotary.org). It makes a TLS session checkable with MPC (multi-party computation) between the operator and a notary, and what comes out is a signed attestation, not a proof you can hand around. The proof a verifier checks is the SP1 proof, which wraps the checks of that attestation.
+
+Why MPC is needed: in a normal TLS connection the client holds all the session keys, so it could write any "response" it likes and encrypt it. A transcript alone proves nothing. In MPC-TLS, the operator's proxy and the notary act together as the TLS client, and the session keys are split between them. Neither can forge or change the server's records alone. The notary does not see the plaintext: for model calls it is shown only the request's session tag and the response's status line, and for tool calls nothing.
+
+After the connection, the notary signs an **attestation**: the time, the server's ephemeral key, commitments to the request and response bytes, and the slot (session and step) it gave out. The operator turns this into a **presentation** that opens every byte. The presentation goes into the witness.
+
+So the signatures that matter are the notary's signature on the attestation, the server's own signature on its ephemeral key during the TLS handshake, and the certificate authorities' signatures on the server's certificate. The guest walks this chain of evidence:
+
+```mermaid
+flowchart TB
+    ROOT["root CA<br/>(Mozilla set or pinned)"] -->|"signs, via intermediates"| CERT["certificate for api.anthropic.com"]
+    CERT -->|"signs, in the TLS handshake"| EK["server's ephemeral key"]
+    NK["notary key<br/>(pinned by the verifier)"] -->|signs| ATT["attestation:<br/>time, server ephemeral key,<br/>transcript commitments, slot"]
+    EK -. "must be the same key" .-> ATT
+    ATT -->|"commits to"| BYTES["request and response bytes"]
+    BYTES -->|"request must equal the one the guest rebuilt"| OK["reply accepted"]
+```
+
+1. **Notary**: the attestation is signed by the pinned notary key, under this project's own signature scheme. A stock TLSNotary notary with the same key would not enforce one reply per slot, so its signatures are rejected.
+2. **Server**: the certificate chain for the expected host is valid at the notarized time under the trusted roots, and the certificate's key signed the ephemeral key the notary attested. So the other end of the connection really was that server.
+3. **Bytes**: the revealed request and response open the attestation's commitments, over TLS 1.2, with nothing redacted.
+4. **Harness**: the slot is this session and step; the request equals, byte for byte, the request the guest rebuilt from its own state; the response is exactly one well-formed HTTP response; and the reply comes from the expected model.
+
+Nothing may be redacted, because hidden bytes could carry a second, hidden request. The cost is that the API key ends up in the witness (see docs/ZKTLS.md, section 5.1).
+
+The SP1 proof then says that all of this was checked and that the harness used exactly these bytes. A verifier needs neither the presentations nor TLSNotary.
 
 ## Quick start
 
