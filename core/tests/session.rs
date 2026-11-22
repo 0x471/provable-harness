@@ -437,7 +437,7 @@ fn operation_budget_is_deterministic() {
     let (live, w) = live_run(&input(), replies);
     let replay = verify_witness(&w).unwrap();
     assert_eq!(live.claim, replay.claim);
-    assert!(replay.messages[2].content.contains("Too many operations"), "{}", replay.messages[2].content);
+    assert!(replay.messages[2].content.contains("script terminated: it used more than"), "{}", replay.messages[2].content);
 }
 
 #[test]
@@ -625,7 +625,7 @@ fn session_operation_budget_and_string_limit() {
     let (live, w) = live_run(&inp, replies);
     assert_eq!(verify_witness(&w).unwrap().claim, live.claim);
     let m = |i: usize| live.messages[i].content.clone();
-    assert!(m(2).contains("Too many operations"), "{}", m(2));
+    assert!(m(2).contains("it used more than 1000 operations"), "{}", m(2));
     assert!(m(4).contains("budget of 1500 operations is exhausted"), "{}", m(4));
     assert!(m(6).contains("budget of 1500 operations is exhausted"), "{}", m(6));
 

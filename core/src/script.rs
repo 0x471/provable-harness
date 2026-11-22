@@ -240,12 +240,26 @@ pub(crate) struct ToolEnv {
 /// session's data volume (see `Policy::max_session_data`).
 pub(crate) struct OpsMeter {
     cap: u64,
+    script_cap: u64,
     used: core::cell::Cell<u64>,
     current: core::cell::Cell<u64>,
     exhausted: core::cell::Cell<bool>,
+    script_exhausted: core::cell::Cell<bool>,
     data_cap: u64,
     data_used: core::cell::Cell<u64>,
     data_exhausted: core::cell::Cell<bool>,
+}
+
+impl OpsMeter {
+    /// Charge data-volume units; false once the session's budget is gone.
+    fn charge(&self, units: u64) -> bool {
+        let used = self.data_used.get().saturating_add(units);
+        self.data_used.set(used);
+        if used > self.data_cap {
+            self.data_exhausted.set(true);
+        }
+        !self.data_exhausted.get()
+    }
 }
 
 impl ToolEnv {
@@ -257,6 +271,7 @@ impl ToolEnv {
         blind: Digest,
     ) -> Self {
         let policy_session_ops = policy.max_session_operations;
+        let policy_script_ops = policy.max_script_operations;
         let policy_session_data = policy.max_session_data;
         Self {
             policy,
@@ -278,9 +293,11 @@ impl ToolEnv {
             abort: Rc::new(core::cell::Cell::new(false)),
             ops: Rc::new(OpsMeter {
                 cap: policy_session_ops,
+                script_cap: policy_script_ops,
                 used: Default::default(),
                 current: Default::default(),
                 exhausted: Default::default(),
+                script_exhausted: Default::default(),
                 data_cap: policy_session_data,
                 data_used: Default::default(),
                 data_exhausted: Default::default(),
@@ -494,7 +511,9 @@ pub(crate) fn invoke(
 pub(crate) fn build_engine(env: &Rc<RefCell<ToolEnv>>, policy: &Policy) -> Engine {
     let mut engine = Engine::new();
     engine
-        .set_max_operations(policy.max_script_operations)
+        // The harness counts operations itself (`on_progress` below); Rhai's
+        // own limit, one past it, is only a backstop.
+        .set_max_operations(policy.max_script_operations.saturating_add(1))
         .set_max_string_size(policy.max_string_bytes as usize)
         .set_max_array_size(4096)
         .set_max_map_size(4096)
@@ -509,27 +528,24 @@ pub(crate) fn build_engine(env: &Rc<RefCell<ToolEnv>>, policy: &Policy) -> Engin
     // Operators must be native calls so the data-volume meter sees them.
     engine.set_fast_operators(false);
     let meter = env.borrow().ops.clone();
-    engine.on_data_volume(move |units| {
-        let used = meter.data_used.get().saturating_add(units);
-        meter.data_used.set(used);
-        if used > meter.data_cap {
-            meter.data_exhausted.set(true);
-            return Some(Dynamic::UNIT);
-        }
-        None
-    });
+    engine.on_data_volume(move |units| (!meter.charge(units)).then_some(Dynamic::UNIT));
     let abort = env.borrow().abort.clone();
     let ops = env.borrow().ops.clone();
-    engine.on_progress(move |count| {
-        ops.current.set(count);
-        if ops.data_exhausted.get() {
-            return Some(Dynamic::UNIT);
+    engine.on_progress(move |_| {
+        // Rhai's own count restarts in every callback a native function makes
+        // (`map`, `sort`, ...: each gets a copy of the runtime state), so the
+        // harness counts the calls of this hook. Exhaustion is sticky: if a
+        // native function swallows the error, the next operation stops again.
+        let n = ops.current.get() + 1;
+        ops.current.set(n);
+        if n > ops.script_cap {
+            ops.script_exhausted.set(true);
         }
-        if ops.used.get().saturating_add(count) > ops.cap {
+        if ops.used.get().saturating_add(n) > ops.cap {
             ops.exhausted.set(true);
-            return Some(Dynamic::UNIT);
         }
-        abort.get().then_some(Dynamic::UNIT)
+        let stop = ops.data_exhausted.get() || ops.exhausted.get() || ops.script_exhausted.get();
+        (stop || abort.get()).then_some(Dynamic::UNIT)
     });
 
     // Deterministic, JSON-valued rendering (see render.rs): override Rhai's
@@ -636,6 +652,7 @@ pub(crate) fn run_script(
         e.script_denied = 0;
         e.abort.set(false);
         e.ops.current.set(0);
+        e.ops.script_exhausted.set(false);
     }
     let res = engine.eval::<Dynamic>(code);
     let mut e = env.borrow_mut();
@@ -662,6 +679,13 @@ pub(crate) fn run_script(
         report.error = Some(format!(
             "script terminated: the session's budget of {} operations is exhausted",
             e.ops.cap
+        ));
+        return Ok(report);
+    }
+    if e.ops.script_exhausted.get() {
+        report.error = Some(format!(
+            "script terminated: it used more than {} operations",
+            e.ops.script_cap
         ));
         return Ok(report);
     }
