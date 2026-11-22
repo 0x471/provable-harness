@@ -277,6 +277,10 @@ impl Engine {
                         .map_err(|err| err.fill_position(pos))?;
                 }
 
+                // (provable-harness patch) Interpolation copies every piece.
+                #[cfg(not(feature = "unchecked"))]
+                self.track_data_volume(1 + concat.len(), expr.position())?;
+
                 Ok(self.get_interned_string(concat).into())
             }
 
