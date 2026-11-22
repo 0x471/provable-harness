@@ -25,7 +25,7 @@ pub fn check_format_prefix(bytes: &[u8], offset: usize) -> Result<(), String> {
     if v != FORMAT_VERSION {
         return Err(format!(
             "this file has format v{v} (or predates format versions); this harness reads v{FORMAT_VERSION}. \
-             Use the release whose program vk matches the file (git tags vk-*)."
+             Use a `ph` built from the commit of the program vk the file was made for."
         ));
     }
     Ok(())
