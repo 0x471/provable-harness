@@ -6,6 +6,8 @@ The agent runs as usual. Afterwards, the [SP1](https://github.com/succinctlabs/s
 
 Status: research prototype, not audited.
 
+Contents: [Why](#why) | [What a proof tells you](#what-a-verified-proof-tells-you) | [Use cases](#use-cases) | [How it works](#how-it-works) | [What SP1 checks](#what-the-sp1-proof-checks) | [zkTLS inside the proof](#how-a-zktls-reply-is-checked-inside-the-proof) | [Threat model](#threat-model) | [Quick start](#quick-start) | [Evals](#provable-evals) | [Results](#results) | [Layout](#repository-layout)
+
 ## Why
 
 Proving that a model produced some output covers only half of an agent. The harness around the model decides what the model sees, which tools it may use and what happens to their results. Most failures that matter for safety happen in that layer: a prompt injection in a web page, a secret that gets sent somewhere, a log that gets edited afterwards. This project proves what the harness did, not just what the model said.
@@ -27,7 +29,7 @@ What it does not tell you:
 - What the operator did outside the harness.
 - That secrets stay private. Compressed STARK proofs are not zero-knowledge, so keep them as private as the recording. The optional Groth16 mode is zero-knowledge (implemented, not yet run end to end).
 
-[docs/DESIGN.md](docs/DESIGN.md) covers the threat model and the limits in detail.
+The [threat model](#threat-model) below goes through the attacks one by one.
 
 ## Use cases
 
@@ -169,9 +171,46 @@ flowchart TB
 3. **Bytes**: the revealed request and response open the attestation's commitments, over TLS 1.2, with nothing redacted.
 4. **Harness**: the slot is this session and step; the request equals, byte for byte, the request the guest rebuilt from its own state; the response is exactly one well-formed HTTP response; and the reply comes from the expected model.
 
-Nothing may be redacted, because hidden bytes could carry a second, hidden request. The cost is that the API key ends up in the witness (see docs/ZKTLS.md, section 5.1).
+Nothing may be redacted, because hidden bytes could carry a second, hidden request. The cost is that the API key ends up in the witness (see the threat model).
 
 The SP1 proof then says that all of this was checked and that the harness used exactly these bytes. A verifier needs neither the presentations nor TLSNotary.
+
+## Threat model
+
+Two kinds of attacker:
+
+- **The operator.** They run the harness, hold the witness, control the connections to the model and the tools, and decide when to run. They want a proof of something that did not happen, or a better-looking version of what did.
+- **Hostile content.** Web pages, files and tool results the agent reads. They want the agent to leak data or break the policy, or to make proving too expensive.
+
+| Attack | What stops it |
+|---|---|
+| Show the model a different prompt than the published one | The guest rebuilds every request from the published inputs, and the reply's signature or TLS transcript must match that exact request. |
+| Fake or edit a model reply | The gateway's signature, or the notary's attestation. |
+| Re-sample the model until it says something nicer | The session id comes from the verifier, and the gateway or notary hands out one reply per session and step. |
+| Reuse a reply from another session or step | Session and step are inside the signed request and the notary's slot. |
+| Hide extra request bytes in a redacted part of the TLS transcript | Redaction is not allowed. |
+| Edit, reorder or drop tool results | Each result is signed or notarized for its exact call and position; missing or left-over results fail. |
+| Cut a website's response short so that it looks like an error | A truncated or ambiguously framed response aborts the session. |
+| Run under a looser policy or another prompt and claim the published one | Their hashes are in the claim, and the verifier compares them. |
+| Run modified harness code | Different code, different vk. The build is reproducible, so the vk can be checked against the source. |
+| Edit the claim or the eval report after proving | SP1 verification fails. |
+| Pick the eval seed, drop bad runs, or run them again | The seed comes from the verifier or a drand round, so the operator cannot choose the session ids. The notary refuses a second reply for the same slot, missing runs are reported, and the notary's log shows which ones were withheld. |
+| Use a notary that does not enforce one reply per slot | Only this project's notary signature scheme is accepted. |
+| Injected text tells the agent to send a secret somewhere | Every call is checked against the policy with its real arguments (for example, no network after reading a secret), and the attempt is on record. |
+| An injected script tries to reach the OS, stall, or swallow a fatal error | Scripts have no OS access, `sleep` is disabled, and backend failures cannot be caught. |
+| An injected script tries to make proving too expensive | The metered engine and the policy budgets cap the cost. |
+
+What stays trusted:
+
+- **The notary**, in zkTLS mode. A notary colluding with the operator can forge transcripts. Use an independent notary, a notary in a TEE, or several notaries.
+- **The model provider.** zkTLS shows what `api.anthropic.com` returned, not how it computed the reply or which weights ran.
+- **The web PKI.** A mis-issued certificate breaks server authentication, and revocation is not checked. Pin roots and require fresh sessions.
+- **The gateway and oracle**, in default mode.
+- **Privacy of the witness.** It contains the API key, and compressed proofs are not zero-knowledge. Use a short-lived key, keep proofs private, or use Groth16.
+- **Everything outside the harness.** The proof covers what this harness did, not other actions by the operator.
+- **SP1 and this code**, neither of which has been audited here.
+
+[docs/DESIGN.md](docs/DESIGN.md) and [docs/ZKTLS.md](docs/ZKTLS.md) go into each of these.
 
 ## Quick start
 
