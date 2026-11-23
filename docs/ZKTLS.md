@@ -9,6 +9,8 @@ The claim then says: the server holding a WebPKI certificate for `api.anthropic.
 
 Select them with `SessionInput.model_auth = ModelAuth::ZkTls(ZkTlsConfig { notary, host, roots, model, max_tokens })` and `SessionInput.tool_auth = ToolAuth::ZkTls(ToolTlsConfig { notary, roots })`. Their hashes are in the claim as `model_auth_hash` and `tool_auth_hash`.
 
+**What "zk" covers here.** "zkTLS" is the common name for protocols that prove to a third party what an HTTPS server sent. This mode uses the MPC kind, TLSNotary: the operator's proxy and the notary act together as the TLS client, with the session keys split between them. The zero-knowledge part is between those two. The proxy proves to the notary, with TLSNotary's interactive zero-knowledge proof, that its commitments are to the plaintext of the TLS records, so the notary signs them having seen, of the plaintext, only a model request's session tag and the response's status line (none of a tool call's). Toward whoever checks the proof, nothing is zero-knowledge yet: the presentation discloses the whole transcript, API key included, because redaction is unsound here (section 5.1), and it sits in the private witness. Hiding it is SP1's job, and compressed proofs are not assumed to hide it; the Groth16 mode should, but has not produced a proof here yet. Against third parties this is notarized TLS checked inside a zkVM, and it rests on the notary (section 5.2).
+
 ## 1. Pieces
 
 ```
